@@ -231,10 +231,151 @@ def test_cli_export(tmp_path):
 
 
 # ----------------------------------------------------------------------
+# Model files (.3dgg)
+# ----------------------------------------------------------------------
+def preset_views():
+    return {key: (gg.SLIDE1_PRESET[key], True) for key in gg.VIEW_KEYS}
+
+
+def test_model_round_trip(tmp_path):
+    path = tmp_path / "taper.3dgg"
+    export = {"format": "GDSII layout (.gds)", "gds_layer": "5/1", "cell_name": "taper"}
+    gg.write_model(str(path), gg.model_to_dict(preset_views(), export, snap=False))
+    data = gg.read_model(str(path))
+    assert data["format"] == "3dgg" and data["generator"] == f"{gg.APP_NAME} {gg.__version__}"
+    for key in gg.VIEW_KEYS:
+        assert data["views"][key]["points"] == [[float(u), float(v)] for u, v in gg.SLIDE1_PRESET[key]]
+        assert data["views"][key]["closed"] is True
+    assert data["export"] == export and data["editor"] == {"snap": False}
+
+
+@pytest.mark.parametrize(
+    "content, message",
+    [
+        ("not json", "not a valid"),
+        ('{"format": "other"}', "not a 3D Geometry Generation model"),
+        ('{"format": "3dgg", "format_version": 99, "views": {}}', "newer version"),
+        ('{"format": "3dgg", "views": {"xy": {"points": [[1, "a"]]}}}', "non-numeric"),
+        ('{"format": "3dgg", "views": {"xy": {"points": [[1, 2, 3]]}}}', "invalid point"),
+    ],
+)
+def test_read_model_rejects_bad_files(tmp_path, content, message):
+    path = tmp_path / "bad.3dgg"
+    path.write_text(content)
+    with pytest.raises(gg.GeometryError, match=message):
+        gg.read_model(str(path))
+
+
+# ----------------------------------------------------------------------
+# Version / update check (network mocked)
+# ----------------------------------------------------------------------
+def test_version_helpers():
+    assert gg.parse_version("v0.3.1") == (0, 3, 1)
+    assert gg.parse_version("1.2") == (1, 2, 0)
+    assert gg.is_newer_version("0.3.1", "0.3.0")
+    assert gg.is_newer_version("0.10.0", "0.9.9")
+    assert not gg.is_newer_version("v0.3.0", "0.3.0")
+    with open(gg.__file__, encoding="utf-8") as fh:
+        assert gg.read_version_from_source(fh.read()) == gg.__version__
+
+
+def test_fetch_latest_version_falls_back_to_main_branch(monkeypatch):
+    import urllib.error
+
+    def fake_get(url, timeout=10.0):
+        if "releases/latest" in url:
+            raise urllib.error.HTTPError(url, 404, "Not Found", {}, None)
+        assert url.endswith("/main/geometry_gui.py")
+        return b'"""doc"""\n__version__ = "0.4.2"\n'
+
+    monkeypatch.setattr(gg, "_http_get", fake_get)
+    info = gg.fetch_latest_version()
+    assert info["version"] == "0.4.2" and info["ref"] == "main"
+
+
+def test_fetch_latest_version_prefers_release(monkeypatch):
+    payload = b'{"tag_name": "v0.5.0", "html_url": "https://example/rel", "body": "notes"}'
+    monkeypatch.setattr(gg, "_http_get", lambda url, timeout=10.0: payload)
+    info = gg.fetch_latest_version()
+    assert (info["version"], info["ref"], info["notes"]) == ("0.5.0", "v0.5.0", "notes")
+
+
+def test_download_and_apply_update(monkeypatch, tmp_path):
+    new_source = '__version__ = "9.9.9"\nprint("hello")\n'
+    monkeypatch.setattr(gg, "_http_get", lambda url, timeout=30.0: new_source.encode())
+    text, version = gg.download_update("v9.9.9", "9.9.9")
+    target = tmp_path / "geometry_gui.py"
+    target.write_text("old")
+    backup = gg.apply_update(text, str(target), home=str(tmp_path / "home"))
+    assert target.read_text() == new_source and open(backup).read() == "old"
+
+    monkeypatch.setattr(gg, "_http_get", lambda url, timeout=30.0: b'__version__ = "1.0"\nif:\n')
+    with pytest.raises(SyntaxError):
+        gg.download_update("main")
+
+
+# ----------------------------------------------------------------------
+# Config & per-user installation (into a temporary home)
+# ----------------------------------------------------------------------
+def test_config_round_trip_and_corrupt_file(tmp_path):
+    home = str(tmp_path)
+    cfg, existed = gg.load_config(home)
+    assert not existed and cfg["check_updates_on_start"] is True
+    gg.add_recent_file(cfg, str(tmp_path / "a.3dgg"))
+    gg.save_config(cfg, home)
+    again, existed = gg.load_config(home)
+    assert existed and again["recent_files"] == [str(tmp_path / "a.3dgg")]
+    assert os.path.exists(os.path.join(home, ".3dgg", "config.json"))
+
+    with open(gg.config_path(home), "w") as fh:
+        fh.write("{broken")
+    cfg, existed = gg.load_config(home)
+    assert not existed and os.path.exists(gg.config_path(home) + ".broken")
+
+
+def test_install_linux(tmp_path):
+    home = str(tmp_path)
+    info = gg.install_app(home=home, platform="linux", python="/usr/bin/python3", register=False)
+    script = os.path.join(home, ".3dgg", "app", "geometry_gui.py")
+    assert os.path.exists(script)
+    launcher = os.path.join(home, ".local", "bin", "3dgg")
+    assert os.access(launcher, os.X_OK) and script in open(launcher).read()
+    desktop = open(os.path.join(home, ".local", "share", "applications", "3dgg.desktop")).read()
+    assert "Name=3D Geometry Generation" in desktop and "MimeType=application/x-3dgg;" in desktop
+    assert os.path.exists(os.path.join(home, ".local", "share", "mime", "packages", "3dgg.xml"))
+    removed = gg.uninstall_app(info["paths"], home=home)
+    assert removed and not os.path.exists(launcher) and not os.path.exists(script)
+
+
+def test_install_macos_bundle(tmp_path):
+    import plistlib
+
+    home = str(tmp_path)
+    info = gg.install_app(home=home, platform="darwin", python="/usr/bin/python3", register=False)
+    bundle = os.path.join(home, "Applications", "3D Geometry Generation.app")
+    with open(os.path.join(bundle, "Contents", "Info.plist"), "rb") as fh:
+        plist = plistlib.load(fh)
+    assert plist["CFBundleShortVersionString"] == gg.__version__
+    assert plist["UTExportedTypeDeclarations"][0]["UTTypeTagSpecification"]["public.filename-extension"] == ["3dgg"]
+    assert os.access(os.path.join(bundle, "Contents", "MacOS", "3dgg"), os.X_OK)
+    gg.install_app(home=home, platform="darwin", python="/usr/bin/python3", register=False)  # reinstall works
+    gg.uninstall_app(info["paths"], home=home)
+    assert not os.path.exists(bundle)
+
+
+def test_uninstall_ignores_paths_outside_home(tmp_path):
+    outside = tmp_path / "outside.txt"
+    outside.write_text("keep")
+    assert gg.uninstall_app([str(outside)], home=str(tmp_path / "home")) == []
+    assert outside.exists()
+
+
+# ----------------------------------------------------------------------
 # GUI smoke tests (skipped without a display)
 # ----------------------------------------------------------------------
 @pytest.fixture
-def app(monkeypatch):
+def app(monkeypatch, tmp_path):
+    monkeypatch.setenv("GG3D_HOME", str(tmp_path / "home"))  # never touch the real ~/.3dgg
     tk = pytest.importorskip("tkinter")
     try:
         root = tk.Tk()
@@ -273,6 +414,28 @@ def test_gui_incomplete_views_warn_instead_of_crash(app):
 def test_gui_generate_file_all_formats(app, tmp_path, monkeypatch):
     app.load_slide1_preset()
     app.format_var.set("All (.lsf + .gds + .py)")
-    monkeypatch.setattr(gg.filedialog, "asksaveasfilename", lambda **k: str(tmp_path / "out.lsf"))
+    out_dir = tmp_path / "export"
+    out_dir.mkdir()
+    monkeypatch.setattr(gg.filedialog, "asksaveasfilename", lambda **k: str(out_dir / "out.lsf"))
     app.generate_file()
-    assert sorted(p.name for p in tmp_path.iterdir()) == ["out.gds", "out.lsf", "out.py"]
+    assert sorted(p.name for p in out_dir.iterdir()) == ["out.gds", "out.lsf", "out.py"]
+    assert app.config["last_export_dir"] == str(out_dir)
+
+
+def test_gui_save_and_open_model(app, tmp_path):
+    app.load_slide1_preset()
+    app.ent_cell.delete(0, "end")
+    app.ent_cell.insert(0, "my_cell")
+    assert app.dirty
+    path = tmp_path / "model.3dgg"
+    assert app.save_model_to(str(path))
+    assert not app.dirty and app.model_path == str(path)
+
+    app.dirty = False
+    app.clear_all()
+    app.dirty = False
+    assert app.open_model_path(str(path))
+    assert app.view_xy.points == [[float(u), float(v)] for u, v in gg.SLIDE1_PRESET["xy"]]
+    assert app.ent_cell.get() == "my_cell"
+    assert app.geometry is not None and not app.dirty
+    assert app.config["recent_files"][0] == str(path)

@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Interactive 4-View 3D Geometry Builder for Ansys Lumerical (.lsf), GDSII and gdsfactory
-=======================================================================================
+3D Geometry Generation — interactive 4-view 3D geometry builder for
+Ansys Lumerical (.lsf), GDSII and gdsfactory
+===================================================================
 Opens a window divided into four quadrants:
   - Top-Left     : Top view (x-y)
   - Bottom-Left  : Side view / Cross section (x-z)
@@ -28,19 +29,36 @@ Features:
         a LayerStack (thickness / z position); running it writes the .gds
         (usable with gdsfactory and gdsfactory+),
       * or all three at once.
+  - Models (the points of the three views + export settings) are saved and
+    opened as .3dgg files (JSON), via the File menu.
+  - Help > Check for Updates compares with https://github.com/varallyay/Geometry_gui
+    and can install a newer version.
+  - On first start (macOS / Linux) it offers a per-user installation and
+    creates its configuration in ~/.3dgg/config.json.
 
-Headless use (no GUI):
-    python geometry_gui.py --export-preset out.lsf out.gds out.py
+Usage:
+    python geometry_gui.py [model.3dgg]
+    python geometry_gui.py --export-preset out.lsf out.gds out.py   (headless)
+    python geometry_gui.py --install | --uninstall | --check-updates | --version
 """
+
+__version__ = "0.3.0"
+APP_NAME = "3D Geometry Generation"
 
 import argparse
 import datetime
+import json
 import keyword
 import math
 import os
 import re
+import shlex
+import shutil
 import struct
+import subprocess
 import sys
+import threading
+import time
 from dataclasses import dataclass
 
 os.environ.setdefault("TK_SILENCE_DEPRECATION", "1")
@@ -705,6 +723,486 @@ def export_geometry(geom, path, cell_name=DEFAULT_CELL_NAME, layer=DEFAULT_GDS_L
 
 
 # ======================================================================
+# Model files (.3dgg): JSON with the points of the three 2D views
+# ======================================================================
+MODEL_EXT = ".3dgg"
+MODEL_FORMAT = "3dgg"
+MODEL_FORMAT_VERSION = 1
+VIEW_KEYS = ("xy", "xz", "yz")
+
+
+def model_to_dict(views, export=None, snap=True):
+    """
+    Builds the .3dgg document.
+
+    views: {"xy": (points, closed), "xz": ..., "yz": ...} with points as [[u, v], ...] in micrometers.
+    """
+    return {
+        "format": MODEL_FORMAT,
+        "format_version": MODEL_FORMAT_VERSION,
+        "generator": f"{APP_NAME} {__version__}",
+        "saved": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
+        "units": "um",
+        "material": DEFAULT_MATERIAL,
+        "views": {
+            key: {"points": [[float(u), float(v)] for u, v in views[key][0]], "closed": bool(views[key][1])}
+            for key in VIEW_KEYS
+        },
+        "export": dict(export or {}),
+        "editor": {"snap": bool(snap)},
+    }
+
+
+def _write_text_atomic(path, text):
+    """Writes text via a temporary file so an interrupted save never leaves a truncated file."""
+    tmp = f"{path}.tmp-{os.getpid()}"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(text)
+    os.replace(tmp, path)
+
+
+def write_model(path, data):
+    _write_text_atomic(path, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+
+
+def read_model(path):
+    """Reads and validates a .3dgg file. Raises GeometryError with a readable message on problems."""
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except OSError as exc:
+        raise GeometryError(f"Cannot open {os.path.basename(path)}: {exc.strerror or exc}") from exc
+    except ValueError as exc:
+        raise GeometryError(f"{os.path.basename(path)} is not a valid {MODEL_EXT} (JSON) file: {exc}") from exc
+
+    if not isinstance(data, dict) or data.get("format") != MODEL_FORMAT:
+        raise GeometryError(f"{os.path.basename(path)} is not a {APP_NAME} model file.")
+    file_version = data.get("format_version", 1)
+    if not isinstance(file_version, int) or file_version > MODEL_FORMAT_VERSION:
+        raise GeometryError(
+            f"{os.path.basename(path)} was saved by a newer version ({data.get('generator', 'unknown')}). "
+            "Please update the application."
+        )
+
+    views = data.get("views")
+    if not isinstance(views, dict):
+        raise GeometryError("The model file has no 'views' section.")
+    clean = {}
+    for key in VIEW_KEYS:
+        view = views.get(key, {"points": [], "closed": False})
+        pts = view.get("points", []) if isinstance(view, dict) else None
+        if not isinstance(pts, list):
+            raise GeometryError(f"View '{key}' in the model file is malformed.")
+        out = []
+        for p in pts:
+            if not (isinstance(p, (list, tuple)) and len(p) == 2):
+                raise GeometryError(f"View '{key}' contains an invalid point: {p!r}")
+            try:
+                u, v = float(p[0]), float(p[1])
+            except (TypeError, ValueError):
+                raise GeometryError(f"View '{key}' contains a non-numeric point: {p!r}") from None
+            if not (math.isfinite(u) and math.isfinite(v)):
+                raise GeometryError(f"View '{key}' contains a non-finite point: {p!r}")
+            out.append([u, v])
+        clean[key] = {"points": out, "closed": bool(view.get("closed", len(out) >= 3))}
+
+    export = data.get("export") if isinstance(data.get("export"), dict) else {}
+    editor = data.get("editor") if isinstance(data.get("editor"), dict) else {}
+    return {**data, "views": clean, "export": export, "editor": editor}
+
+
+# ======================================================================
+# Per-user configuration (~/.3dgg/config.json)
+# ======================================================================
+CONFIG_DIRNAME = ".3dgg"
+MAX_RECENT_FILES = 10
+
+
+def user_home():
+    """Home folder; GG3D_HOME overrides it (used by the tests and for portable setups)."""
+    return os.environ.get("GG3D_HOME") or os.path.expanduser("~")
+
+
+def config_dir(home=None):
+    return os.path.join(home or user_home(), CONFIG_DIRNAME)
+
+
+def config_path(home=None):
+    return os.path.join(config_dir(home), "config.json")
+
+
+def default_config():
+    return {
+        "config_version": 1,
+        "app_version": __version__,
+        "created": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
+        "check_updates_on_start": True,
+        "last_update_check": None,
+        "skipped_version": None,
+        "install": {"prompt": True, "installed": False, "version": None, "date": None, "app_dir": None, "paths": []},
+        "recent_files": [],
+        "last_model_dir": None,
+        "last_export_dir": None,
+    }
+
+
+def load_config(home=None):
+    """Returns (config, existed). A corrupt file is kept as config.json.broken and replaced by defaults."""
+    cfg = default_config()
+    path = config_path(home)
+    if not os.path.exists(path):
+        return cfg, False
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            stored = json.load(fh)
+        if not isinstance(stored, dict):
+            raise ValueError("not a JSON object")
+    except (OSError, ValueError):
+        try:
+            os.replace(path, path + ".broken")
+        except OSError:
+            pass
+        return cfg, False
+    for key, value in stored.items():
+        if isinstance(cfg.get(key), dict) and isinstance(value, dict):
+            cfg[key].update(value)
+        else:
+            cfg[key] = value
+    return cfg, True
+
+
+def save_config(cfg, home=None):
+    os.makedirs(config_dir(home), exist_ok=True)
+    cfg["app_version"] = __version__
+    _write_text_atomic(config_path(home), json.dumps(cfg, indent=2, ensure_ascii=False) + "\n")
+
+
+def add_recent_file(cfg, path):
+    path = os.path.abspath(path)
+    recent = [p for p in cfg.get("recent_files", []) if p != path]
+    cfg["recent_files"] = [path] + recent[: MAX_RECENT_FILES - 1]
+
+
+# ======================================================================
+# Update check (GitHub)
+# ======================================================================
+GITHUB_REPO = "varallyay/Geometry_gui"
+PROJECT_URL = f"https://github.com/{GITHUB_REPO}"
+UPDATE_BRANCH = "main"
+UPDATE_FILE = "geometry_gui.py"
+UPDATE_CHECK_INTERVAL_S = 24 * 3600
+
+
+def parse_version(text):
+    """'v0.3.1' -> (0, 3, 1). Missing parts count as 0."""
+    nums = [int(n) for n in re.findall(r"\d+", str(text or ""))[:3]]
+    return tuple(nums + [0] * (3 - len(nums)))
+
+
+def is_newer_version(candidate, current=__version__):
+    return parse_version(candidate) > parse_version(current)
+
+
+def read_version_from_source(text):
+    match = re.search(r"^__version__\s*=\s*[\"']([^\"']+)[\"']", text, re.MULTILINE)
+    return match.group(1) if match else None
+
+
+def _http_get(url, timeout=10.0):
+    """GET url and return the body bytes. Falls back to certifi's CA bundle if the system one is missing."""
+    import ssl
+    import urllib.error
+    import urllib.request
+
+    headers = {"User-Agent": f"3DGG-update-check/{__version__}"}
+    if "api.github.com" in url:
+        headers["Accept"] = "application/vnd.github+json"
+    request = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as resp:
+            return resp.read()
+    except urllib.error.URLError as exc:
+        if not isinstance(getattr(exc, "reason", None), ssl.SSLCertVerificationError):
+            raise
+        try:
+            import certifi
+        except ImportError:
+            raise exc from None
+        context = ssl.create_default_context(cafile=certifi.where())
+        with urllib.request.urlopen(request, timeout=timeout, context=context) as resp:
+            return resp.read()
+
+
+def fetch_latest_version(timeout=10.0):
+    """
+    Asks GitHub for the newest version. Uses the latest release if the repository
+    has one, otherwise the __version__ of geometry_gui.py on the main branch.
+    Returns {"version", "ref", "page", "notes", "source"}.
+    """
+    import urllib.error
+
+    try:
+        data = json.loads(_http_get(f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest", timeout))
+        tag = data["tag_name"]
+        return {
+            "version": tag.lstrip("vV"),
+            "ref": tag,
+            "page": data.get("html_url") or f"{PROJECT_URL}/releases",
+            "notes": (data.get("body") or "").strip(),
+            "source": "release",
+        }
+    except urllib.error.HTTPError as exc:
+        if exc.code != 404:  # 404 = no releases published yet
+            raise
+    source = _http_get(f"https://raw.githubusercontent.com/{GITHUB_REPO}/{UPDATE_BRANCH}/{UPDATE_FILE}", timeout)
+    version = read_version_from_source(source.decode("utf-8", "replace"))
+    if not version:
+        raise GeometryError(f"Could not read the version number of {UPDATE_FILE} on GitHub.")
+    return {"version": version, "ref": UPDATE_BRANCH, "page": PROJECT_URL, "notes": "", "source": "branch"}
+
+
+def download_update(ref, expected_version=None, timeout=30.0):
+    """Downloads geometry_gui.py at the given git ref and checks it is a valid, newer program."""
+    text = _http_get(f"https://raw.githubusercontent.com/{GITHUB_REPO}/{ref}/{UPDATE_FILE}", timeout).decode("utf-8")
+    version = read_version_from_source(text)
+    if not version:
+        raise GeometryError("The downloaded file has no version number — update aborted.")
+    if expected_version and parse_version(version) != parse_version(expected_version):
+        raise GeometryError(f"Expected version {expected_version} but downloaded {version} — update aborted.")
+    compile(text, UPDATE_FILE, "exec")  # raises SyntaxError for a broken download
+    return text, version
+
+
+def is_git_checkout(path):
+    folder = os.path.dirname(os.path.abspath(path))
+    return os.path.exists(os.path.join(folder, ".git"))
+
+
+def apply_update(text, target, home=None):
+    """Replaces target with the new program text; the old file is kept in ~/.3dgg/backups."""
+    backups = os.path.join(config_dir(home), "backups")
+    os.makedirs(backups, exist_ok=True)
+    backup = os.path.join(backups, f"geometry_gui-{__version__}.py")
+    shutil.copy2(target, backup)
+    _write_text_atomic(target, text)
+    os.chmod(target, 0o755)
+    return backup
+
+
+# ======================================================================
+# Per-user installation (macOS: ~/Applications/<app>.app, Linux: XDG desktop entry)
+# ======================================================================
+BUNDLE_ID = "io.github.varallyay.3dgg"
+MODEL_UTI = BUNDLE_ID + ".model"
+MODEL_MIME = "application/x-3dgg"
+ICON_FILES = ("3dgg_icon.png", "3dgg_icon_256.png", "3dgg.icns")
+
+
+def source_dir():
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def asset_path(name, base=None):
+    path = os.path.join(base or source_dir(), "assets", name)
+    return path if os.path.exists(path) else None
+
+
+def installed_app_dir(home=None):
+    return os.path.join(config_dir(home), "app")
+
+
+def is_running_installed_copy(home=None):
+    return os.path.abspath(source_dir()) == os.path.abspath(installed_app_dir(home))
+
+
+def _write_executable(path, text):
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(text)
+    os.chmod(path, 0o755)
+
+
+def _launcher_script(python, script):
+    return f'#!/bin/sh\nexec {shlex.quote(python)} {shlex.quote(script)} "$@"\n'
+
+
+def _copy_program(app_dir, src_dir):
+    """Copies the program and its icons into app_dir (~/.3dgg/app)."""
+    os.makedirs(os.path.join(app_dir, "assets"), exist_ok=True)
+    if os.path.abspath(src_dir) != os.path.abspath(app_dir):
+        shutil.copy2(os.path.join(src_dir, UPDATE_FILE), os.path.join(app_dir, UPDATE_FILE))
+        for name in ICON_FILES:
+            src = asset_path(name, src_dir)
+            if src:
+                shutil.copy2(src, os.path.join(app_dir, "assets", name))
+    return os.path.join(app_dir, UPDATE_FILE)
+
+
+def _install_macos(home, python, script, app_dir, register):
+    import plistlib
+
+    bundle = os.path.join(home, "Applications", f"{APP_NAME}.app")
+    if os.path.exists(bundle):
+        info = os.path.join(bundle, "Contents", "Info.plist")
+        try:
+            with open(info, "rb") as fh:
+                ours = plistlib.load(fh).get("CFBundleIdentifier") == BUNDLE_ID
+        except (OSError, plistlib.InvalidFileException):
+            ours = False
+        if not ours:
+            raise GeometryError(f"{bundle} already exists and was not created by this program.")
+        shutil.rmtree(bundle)
+
+    macos_dir = os.path.join(bundle, "Contents", "MacOS")
+    res_dir = os.path.join(bundle, "Contents", "Resources")
+    os.makedirs(macos_dir)
+    os.makedirs(res_dir)
+    _write_executable(os.path.join(macos_dir, "3dgg"), _launcher_script(python, script))
+    icns = os.path.join(app_dir, "assets", "3dgg.icns")
+    if os.path.exists(icns):
+        shutil.copy2(icns, os.path.join(res_dir, "3dgg.icns"))
+
+    doc_name = f"{APP_NAME} model"
+    plist = {
+        "CFBundleName": APP_NAME,
+        "CFBundleDisplayName": APP_NAME,
+        "CFBundleIdentifier": BUNDLE_ID,
+        "CFBundleVersion": __version__,
+        "CFBundleShortVersionString": __version__,
+        "CFBundleExecutable": "3dgg",
+        "CFBundleIconFile": "3dgg.icns",
+        "CFBundlePackageType": "APPL",
+        "CFBundleInfoDictionaryVersion": "6.0",
+        "NSHighResolutionCapable": True,
+        "LSMinimumSystemVersion": "10.13",
+        "CFBundleDocumentTypes": [
+            {
+                "CFBundleTypeName": doc_name,
+                "CFBundleTypeRole": "Editor",
+                "LSHandlerRank": "Owner",
+                "LSItemContentTypes": [MODEL_UTI],
+                "CFBundleTypeIconFile": "3dgg.icns",
+            }
+        ],
+        "UTExportedTypeDeclarations": [
+            {
+                "UTTypeIdentifier": MODEL_UTI,
+                "UTTypeDescription": doc_name,
+                "UTTypeConformsTo": ["public.json", "public.data"],
+                "UTTypeIconFile": "3dgg.icns",
+                "UTTypeTagSpecification": {
+                    "public.filename-extension": [MODEL_EXT.lstrip(".")],
+                    "public.mime-type": MODEL_MIME,
+                },
+            }
+        ],
+    }
+    with open(os.path.join(bundle, "Contents", "Info.plist"), "wb") as fh:
+        plistlib.dump(plist, fh)
+
+    lsregister = (
+        "/System/Library/Frameworks/CoreServices.framework/Frameworks/"
+        "LaunchServices.framework/Support/lsregister"
+    )
+    if register and os.path.exists(lsregister):
+        subprocess.run([lsregister, "-f", bundle], check=False, capture_output=True)
+    return [bundle], bundle
+
+
+def _install_linux(home, python, script, app_dir, register):
+    share = os.path.join(home, ".local", "share")
+    launcher = os.path.join(home, ".local", "bin", "3dgg")
+    desktop = os.path.join(share, "applications", "3dgg.desktop")
+    mime_xml = os.path.join(share, "mime", "packages", "3dgg.xml")
+    icon_app = os.path.join(share, "icons", "hicolor", "256x256", "apps", "3dgg.png")
+    icon_mime = os.path.join(share, "icons", "hicolor", "256x256", "mimetypes", "application-x-3dgg.png")
+    for path in (launcher, desktop, mime_xml, icon_app, icon_mime):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+
+    _write_executable(launcher, _launcher_script(python, script))
+    icon_src = os.path.join(app_dir, "assets", "3dgg_icon_256.png")
+    created = [launcher, desktop, mime_xml]
+    if os.path.exists(icon_src):
+        shutil.copy2(icon_src, icon_app)
+        shutil.copy2(icon_src, icon_mime)
+        created += [icon_app, icon_mime]
+
+    with open(desktop, "w", encoding="utf-8") as fh:
+        fh.write(
+            "[Desktop Entry]\n"
+            "Type=Application\n"
+            f"Name={APP_NAME}\n"
+            "Comment=Draw 2D views and generate 3D geometry for Lumerical, GDSII and gdsfactory\n"
+            f"Exec={shlex.quote(launcher)} %f\n"
+            "Icon=3dgg\n"
+            "Terminal=false\n"
+            "Categories=Science;Engineering;Graphics;\n"
+            f"MimeType={MODEL_MIME};\n"
+            "StartupWMClass=3dgg\n"
+        )
+    with open(mime_xml, "w", encoding="utf-8") as fh:
+        fh.write(
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">\n'
+            f'  <mime-type type="{MODEL_MIME}">\n'
+            f"    <comment>{APP_NAME} model</comment>\n"
+            '    <sub-class-of type="application/json"/>\n'
+            f'    <glob pattern="*{MODEL_EXT}"/>\n'
+            "    <icon name=\"application-x-3dgg\"/>\n"
+            "  </mime-type>\n"
+            "</mime-info>\n"
+        )
+    if register:
+        for cmd in (
+            ["update-mime-database", os.path.join(share, "mime")],
+            ["update-desktop-database", os.path.join(share, "applications")],
+            ["gtk-update-icon-cache", "-q", "-t", os.path.join(share, "icons", "hicolor")],
+        ):
+            if shutil.which(cmd[0]):
+                subprocess.run(cmd, check=False, capture_output=True)
+    return created, launcher
+
+
+def install_app(home=None, platform=None, python=None, src_dir=None, register=True):
+    """
+    Installs the application for the current user.
+      * copies the program and icons to ~/.3dgg/app
+      * macOS: creates ~/Applications/3D Geometry Generation.app (opens .3dgg files)
+      * Linux: ~/.local/bin/3dgg, a desktop entry, icon and the .3dgg MIME type
+    Returns {"app_dir", "paths", "launcher"}.
+    """
+    home = home or user_home()
+    platform = platform or sys.platform
+    python = python or sys.executable
+    if platform == "darwin":
+        installer = _install_macos
+    elif platform.startswith("linux"):
+        installer = _install_linux
+    else:
+        raise GeometryError(f"Installation is supported on macOS and Linux only (this system: {platform}).")
+
+    app_dir = installed_app_dir(home)
+    script = _copy_program(app_dir, src_dir or source_dir())
+    paths, launcher = installer(home, python, script, app_dir, register)
+    return {"app_dir": app_dir, "paths": [app_dir] + paths, "launcher": launcher}
+
+
+def uninstall_app(paths, home=None):
+    """Removes the paths created by install_app (only ones inside the home folder). Returns removed paths."""
+    home = os.path.abspath(home or user_home())
+    removed = []
+    for path in paths:
+        full = os.path.abspath(path)
+        if not full.startswith(home + os.sep) or full == home or not os.path.lexists(full):
+            continue
+        if os.path.isdir(full) and not os.path.islink(full):
+            shutil.rmtree(full)
+        else:
+            os.remove(full)
+        removed.append(full)
+    return removed
+
+
+# ======================================================================
 # Dark UI theme
 # ======================================================================
 if sys.platform == "darwin":
@@ -911,6 +1409,71 @@ def apply_ttk_dark_style(root):
     root.option_add("*TCombobox*Listbox.selectBackground", THEME["accent"])
     root.option_add("*TCombobox*Listbox.selectForeground", "#ffffff")
     root.option_add("*TCombobox*Listbox.font", (FONT_UI, 11))
+
+
+class ChoiceDialog(tk.Toplevel):
+    """
+    Dark modal dialog with a title, message and a row of buttons.
+    buttons: list of (key, label, variant); returns the chosen key (or cancel_key on Esc / close).
+    """
+
+    def __init__(self, parent, title, message, buttons, default=None, cancel_key=None, detail=None, width=460):
+        super().__init__(parent)
+        self.withdraw()
+        self.title(title)
+        self.configure(bg=THEME["bar_bg"], padx=22, pady=18)
+        self.resizable(False, False)
+        self.transient(parent)
+        self.result = cancel_key
+
+        tk.Label(
+            self, text=title, font=(FONT_UI, 14, "bold"), bg=THEME["bar_bg"], fg=THEME["text"], anchor="w",
+            justify=tk.LEFT,
+        ).pack(fill=tk.X)
+        tk.Label(
+            self, text=message, font=(FONT_UI, 11), bg=THEME["bar_bg"], fg=THEME["text"], anchor="w",
+            justify=tk.LEFT, wraplength=width,
+        ).pack(fill=tk.X, pady=(8, 0))
+        if detail:
+            tk.Label(
+                self, text=detail, font=(FONT_UI, 10), bg=THEME["bar_bg"], fg=THEME["text_muted"], anchor="w",
+                justify=tk.LEFT, wraplength=width,
+            ).pack(fill=tk.X, pady=(8, 0))
+
+        row = tk.Frame(self, bg=THEME["bar_bg"])
+        row.pack(fill=tk.X, pady=(18, 0))
+        # First button on the right is the default (macOS / GNOME convention)
+        for key, label, variant in buttons:
+            FlatButton(row, label, lambda k=key: self._choose(k), variant=variant, size=11, padx=14, pady=6).pack(
+                side=tk.RIGHT, padx=(8, 0)
+            )
+
+        self.bind("<Escape>", lambda e: self._choose(cancel_key))
+        if default is not None:
+            self.bind("<Return>", lambda e: self._choose(default))
+        self.protocol("WM_DELETE_WINDOW", lambda: self._choose(cancel_key))
+
+        # Centre over the parent window
+        self.update_idletasks()
+        px, py = parent.winfo_rootx(), parent.winfo_rooty()
+        pw, ph = parent.winfo_width(), parent.winfo_height()
+        w, h = self.winfo_reqwidth(), self.winfo_reqheight()
+        self.geometry(f"+{px + max(0, (pw - w) // 2)}+{py + max(0, (ph - h) // 3)}")
+        self.deiconify()
+        self.lift()
+        self.focus_force()
+        self.grab_set()
+
+    def _choose(self, key):
+        self.result = key
+        self.grab_release()
+        self.destroy()
+
+    @classmethod
+    def ask(cls, parent, *args, **kwargs):
+        dialog = cls(parent, *args, **kwargs)
+        parent.wait_window(dialog)
+        return dialog.result
 
 
 def _wheel_event(event, direction):
@@ -1774,9 +2337,18 @@ class View3DCanvas(tk.Frame):
 class LumericalGeometryApp:
     """Main application window combining the 4 views and .lsf / .gds / gdsfactory export."""
 
-    def __init__(self, root):
+    def __init__(self, root, config=None, startup_tasks=False):
+        """
+        config: the per-user config dict (default: loaded from ~/.3dgg/config.json).
+        startup_tasks: run the first-start install offer and the automatic update check
+                       (enabled by main(); off for tests / embedding).
+        """
         self.root = root
-        self.root.title("Ansys Lumerical / GDS 3D Geometry Generator — Multi-View Editor")
+        self.config = config if config is not None else load_config()[0]
+        self.model_path = None  # .3dgg file of the current model
+        self.dirty = False  # unsaved changes
+        self._last_shortcut = {}
+        self._update_result = None
         self.root.geometry("1320x880")
         self.root.minsize(1180, 720)
         self.root.configure(bg=THEME["app_bg"])
@@ -1791,6 +2363,17 @@ class LumericalGeometryApp:
         self.geometry_outdated = False  # views edited since the last reconstruction
 
         self._build_ui()
+        self._build_menu()
+        self._set_window_icon()
+        self._update_title()
+        self.root.protocol("WM_DELETE_WINDOW", self.quit_app)
+        if sys.platform == "darwin":
+            # Finder "Open With" / double-click on a .3dgg file, About and Quit from the app menu
+            self.root.createcommand("::tk::mac::OpenDocument", self._mac_open_document)
+            self.root.createcommand("tkAboutDialog", self.show_about)
+            self.root.createcommand("::tk::mac::Quit", self.quit_app)
+        if startup_tasks:
+            self.root.after(700, self._run_startup_tasks)
 
     def _build_ui(self):
         T = THEME
@@ -1808,10 +2391,10 @@ class LumericalGeometryApp:
             title_box, text="◆", font=(FONT_UI, 18), bg=T["bar_bg"], fg=T["shape_edge"]
         ).pack(side=tk.LEFT, padx=(0, 8))
         tk.Label(
-            title_box, text="Geometry Generator", font=(FONT_UI, 15, "bold"), bg=T["bar_bg"], fg=T["text"]
+            title_box, text=APP_NAME, font=(FONT_UI, 15, "bold"), bg=T["bar_bg"], fg=T["text"]
         ).pack(side=tk.LEFT)
         tk.Label(
-            title_box, text="  Lumerical · GDS · gdsfactory", font=(FONT_UI, 11), bg=T["bar_bg"], fg=T["text_dim"]
+            title_box, text=f"  v{__version__}", font=(FONT_UI, 11), bg=T["bar_bg"], fg=T["text_dim"]
         ).pack(side=tk.LEFT)
 
         # Right side, packed right-to-left: [Generate file] [cell] [layer] [format] | [Generate geometry]
@@ -1824,7 +2407,7 @@ class LumericalGeometryApp:
             bold=True,
             padx=16,
             pady=7,
-            tooltip=f"Step 2 — rebuild from the current drawing and save\nin the selected export format  ({mod}+S)",
+            tooltip=f"Step 2 — rebuild from the current drawing and save\nin the selected export format  ({mod}+E)",
         )
         self.btn_gen_file.pack(side=tk.RIGHT, padx=(10, 0))
 
@@ -1897,10 +2480,11 @@ class LumericalGeometryApp:
 
         caption(tools, "Drawing").pack(side=tk.LEFT, padx=(0, 8))
         self.snap_var = tk.BooleanVar(value=True)
-        ToggleButton(
+        self.snap_btn = ToggleButton(
             tools, "Snap to guides / grid", self.snap_var, command=self._toggle_snap,
             tooltip="Snap new and dragged points to guide lines and the grid\n(hold Shift to disable temporarily)",
-        ).pack(side=tk.LEFT, padx=(0, 6))
+        )
+        self.snap_btn.pack(side=tk.LEFT, padx=(0, 6))
         FlatButton(
             tools, "Mirror top (x-y)", self.mirror_xy_top_to_bottom, size=11, padx=10, pady=4,
             tooltip="Mirror the upper (y > 0) outline of the top view across y = 0",
@@ -2050,8 +2634,581 @@ class LumericalGeometryApp:
         self.root.bind("<BackSpace>", lambda e: self._handle_delete_key())
         self.root.bind("<Delete>", lambda e: self._handle_delete_key())
         accel = "Command" if sys.platform == "darwin" else "Control"
-        self.root.bind(f"<{accel}-g>", lambda e: self.generate_geometry())
-        self.root.bind(f"<{accel}-s>", lambda e: self.generate_file())
+        self._accel = accel
+
+    # ==================================================================
+    # Menu bar & keyboard shortcuts
+    # ==================================================================
+    def _shortcut(self, name, func):
+        """
+        Runs a menu / shortcut action once. On macOS a menu key equivalent and the
+        matching key binding can both fire for one key press; the second call
+        (arriving right after the first finished) is ignored.
+        """
+        now = time.monotonic()
+        if now - self._last_shortcut.get(name, -1.0) < 0.35:
+            return "break"
+        try:
+            func()
+        finally:
+            self._last_shortcut[name] = time.monotonic()
+        return "break"
+
+    def _build_menu(self):
+        mac = sys.platform == "darwin"
+        accel_label = "Command-" if mac else "Ctrl+"
+        menubar = tk.Menu(self.root)
+
+        def add(menu, label, name, func, key=None, shift=False):
+            accel = None
+            if key:
+                accel = f"{accel_label}{'Shift-' if mac and shift else ('Shift+' if shift else '')}{key.upper()}"
+                keysym = key.upper() if shift else key.lower()
+                self.root.bind(f"<{self._accel}-{keysym}>", lambda e: self._shortcut(name, func))
+            menu.add_command(label=label, accelerator=accel, command=lambda: self._shortcut(name, func))
+
+        if mac:
+            app_menu = tk.Menu(menubar, name="apple", tearoff=False)
+            app_menu.add_command(label=f"About {APP_NAME}", command=self.show_about)
+            app_menu.add_command(label="Check for Updates…", command=lambda: self.check_for_updates(manual=True))
+            app_menu.add_separator()
+            menubar.add_cascade(menu=app_menu)
+
+        file_menu = tk.Menu(menubar, tearoff=False)
+        add(file_menu, "New", "new", self.new_model, "n")
+        add(file_menu, "Open…", "open", self.open_model, "o")
+        self.recent_menu = tk.Menu(file_menu, tearoff=False)
+        file_menu.add_cascade(label="Open Recent", menu=self.recent_menu)
+        file_menu.add_separator()
+        add(file_menu, "Save", "save", self.save_model, "s")
+        add(file_menu, "Save As…", "save_as", self.save_model_as, "s", shift=True)
+        file_menu.add_separator()
+        add(file_menu, "Export (Generate file)…", "export", self.generate_file, "e")
+        if not mac:
+            file_menu.add_separator()
+            add(file_menu, "Quit", "quit", self.quit_app, "q")
+        menubar.add_cascade(label="File", menu=file_menu)
+
+        edit_menu = tk.Menu(menubar, tearoff=False)
+        edit_menu.add_command(label="Delete Selected Point", command=self.delete_selected_point)
+        edit_menu.add_command(label="Mirror Top View (x-y)", command=self.mirror_xy_top_to_bottom)
+        edit_menu.add_separator()
+        edit_menu.add_command(label="Load Slide 1 Preset", command=self.load_slide1_preset)
+        edit_menu.add_command(label="Clear All Views", command=self.clear_all)
+        menubar.add_cascade(label="Edit", menu=edit_menu)
+
+        geom_menu = tk.Menu(menubar, tearoff=False)
+        add(geom_menu, "Generate Geometry", "generate", self.generate_geometry, "g")
+        geom_menu.add_command(label="Reset All Views", command=self.reset_all_views)
+        menubar.add_cascade(label="Geometry", menu=geom_menu)
+
+        help_menu = tk.Menu(menubar, tearoff=False)
+        help_menu.add_command(label="Check for Updates…", command=lambda: self.check_for_updates(manual=True))
+        self.check_updates_var = tk.BooleanVar(value=bool(self.config.get("check_updates_on_start", True)))
+        help_menu.add_checkbutton(
+            label="Check for Updates at Startup", variable=self.check_updates_var, command=self._toggle_update_check
+        )
+        help_menu.add_separator()
+        help_menu.add_command(label="Install for This User…", command=self.offer_install)
+        help_menu.add_command(label="Uninstall…", command=self.uninstall_application)
+        self._uninstall_index = help_menu.index("end")
+        help_menu.add_separator()
+        help_menu.add_command(label="Open Configuration Folder", command=self.open_config_folder)
+        help_menu.add_command(label="Project Page on GitHub", command=self.open_project_page)
+        if not mac:
+            help_menu.add_separator()
+            help_menu.add_command(label=f"About {APP_NAME}", command=self.show_about)
+        menubar.add_cascade(label="Help", menu=help_menu)
+        self.help_menu = help_menu
+
+        self.root.config(menu=menubar)
+        self._rebuild_recent_menu()
+        self._refresh_install_menu()
+
+        # Export settings belong to the model: editing them marks it as changed
+        self.format_var.trace_add("write", lambda *a: self._set_dirty(True))
+        mark = self.root.register(lambda: self._set_dirty(True) or True)
+        for entry in (self.ent_layer, self.ent_cell):
+            entry.config(validate="key", validatecommand=(mark,))
+
+    def _rebuild_recent_menu(self):
+        self.recent_menu.delete(0, "end")
+        recent = self.config.get("recent_files", [])
+        for path in recent:
+            self.recent_menu.add_command(
+                label=os.path.basename(path), command=lambda p=path: self.open_model_path(p)
+            )
+        if recent:
+            self.recent_menu.add_separator()
+            self.recent_menu.add_command(label="Clear Menu", command=self._clear_recent)
+        else:
+            self.recent_menu.add_command(label="No recent models", state=tk.DISABLED)
+
+    def _clear_recent(self):
+        self.config["recent_files"] = []
+        self._save_config()
+        self._rebuild_recent_menu()
+
+    def _refresh_install_menu(self):
+        installed = bool(self.config.get("install", {}).get("installed"))
+        self.help_menu.entryconfig(self._uninstall_index, state=tk.NORMAL if installed else tk.DISABLED)
+
+    def _set_window_icon(self):
+        path = asset_path("3dgg_icon_256.png")
+        if not path:
+            return
+        try:
+            self._icon_img = tk.PhotoImage(file=path)
+            self.root.iconphoto(True, self._icon_img)
+        except tk.TclError:
+            pass
+
+    def _save_config(self):
+        try:
+            save_config(self.config)
+        except OSError:
+            pass  # the config is a convenience; never block the user on it
+
+    def reset_all_views(self):
+        for view in self._views().values():
+            view.reset_view()
+        self.view_3d.reset_camera()
+
+    # ==================================================================
+    # Model files (.3dgg)
+    # ==================================================================
+    def _views(self):
+        return {"xy": self.view_xy, "xz": self.view_xz, "yz": self.view_yz}
+
+    def _set_dirty(self, dirty):
+        if dirty != self.dirty:
+            self.dirty = dirty
+            self._update_title()
+
+    def _update_title(self):
+        name = os.path.basename(self.model_path) if self.model_path else "Untitled"
+        self.root.title(f"{name}{' — edited' if self.dirty else ''}  ·  {APP_NAME} {__version__}")
+        if sys.platform == "darwin":
+            try:
+                self.root.wm_attributes("-modified", self.dirty)
+            except tk.TclError:
+                pass
+
+    def _model_dir(self):
+        if self.model_path:
+            return os.path.dirname(self.model_path)
+        last = self.config.get("last_model_dir")
+        return last if last and os.path.isdir(last) else os.path.expanduser("~")
+
+    def model_data(self):
+        """The current model as a .3dgg document (dict)."""
+        views = {key: (view.points, view.closed) for key, view in self._views().items()}
+        export = {
+            "format": self.format_var.get(),
+            "gds_layer": self.ent_layer.get().strip(),
+            "cell_name": self.ent_cell.get().strip(),
+        }
+        return model_to_dict(views, export, self.snap_var.get())
+
+    def apply_model(self, data):
+        """Loads a validated .3dgg document (see read_model) into the views and export settings."""
+        for key, view in self._views().items():
+            view.set_points(data["views"][key]["points"], closed=data["views"][key]["closed"])
+            view.reset_view()
+        export = data.get("export", {})
+        if export.get("format") in EXPORT_FORMATS:
+            self.format_var.set(export["format"])
+        for entry, key in ((self.ent_layer, "gds_layer"), (self.ent_cell, "cell_name")):
+            if isinstance(export.get(key), str) and export[key].strip():
+                entry.delete(0, tk.END)
+                entry.insert(0, export[key].strip())
+        if "snap" in data.get("editor", {}):
+            self.snap_var.set(bool(data["editor"]["snap"]))
+            self.snap_btn._refresh()
+            self._toggle_snap()
+
+        self.view_3d.clear_3d()
+        self.view_3d.set_state("empty")
+        self.geometry = None
+        self.geometry_outdated = False
+        if all(len(v.points) >= 3 for v in self._views().values()):
+            self.generate_geometry(quiet=True)
+
+    def confirm_discard(self):
+        """Asks to save unsaved changes. Returns False if the user cancelled."""
+        if not self.dirty:
+            return True
+        name = os.path.basename(self.model_path) if self.model_path else "Untitled"
+        choice = ChoiceDialog.ask(
+            self.root,
+            "Save changes?",
+            f"Do you want to save the changes made to “{name}”?",
+            [("save", "Save", "primary"), ("discard", "Don't save", "secondary"), ("cancel", "Cancel", "secondary")],
+            default="save",
+            cancel_key="cancel",
+            detail="Your changes will be lost if you don't save them.",
+        )
+        if choice == "save":
+            return self.save_model()
+        return choice == "discard"
+
+    def new_model(self):
+        if not self.confirm_discard():
+            return
+        self.clear_all()
+        self.format_var.set(next(iter(EXPORT_FORMATS)))
+        for entry, value in ((self.ent_layer, f"{DEFAULT_GDS_LAYER[0]}/{DEFAULT_GDS_LAYER[1]}"), (self.ent_cell, DEFAULT_CELL_NAME)):
+            entry.delete(0, tk.END)
+            entry.insert(0, value)
+        self.reset_all_views()
+        self.model_path = None
+        self._set_dirty(False)
+        self._update_title()
+        self.set_status("New model. Draw connected points in the Top (x-y), Side (x-z) and Front (y-z) views.")
+
+    def open_model(self):
+        if not self.confirm_discard():
+            return
+        path = filedialog.askopenfilename(
+            parent=self.root,
+            title=f"Open {APP_NAME} Model",
+            initialdir=self._model_dir(),
+            filetypes=[(f"{APP_NAME} model", f"*{MODEL_EXT}"), ("All files", "*")],
+        )
+        if path:
+            self.open_model_path(path, confirm=False)
+
+    def open_model_path(self, path, confirm=True):
+        """Opens a .3dgg file. Returns True on success."""
+        if confirm and not self.confirm_discard():
+            return False
+        try:
+            data = read_model(path)
+        except GeometryError as exc:
+            if not os.path.exists(path) and path in self.config.get("recent_files", []):
+                self.config["recent_files"].remove(path)
+                self._save_config()
+                self._rebuild_recent_menu()
+            self.set_status(str(exc), "error")
+            messagebox.showerror("Cannot Open Model", str(exc), parent=self.root)
+            return False
+
+        self.apply_model(data)
+        self.model_path = os.path.abspath(path)
+        self._set_dirty(False)
+        self._update_title()
+        self._remember_model_path()
+        self.set_status(f"Opened {os.path.basename(path)}.", "ok")
+        return True
+
+    def save_model(self):
+        """Saves to the current file (asks for a name the first time). Returns True if saved."""
+        if not self.model_path:
+            return self.save_model_as()
+        return self.save_model_to(self.model_path)
+
+    def save_model_as(self):
+        initial = os.path.basename(self.model_path) if self.model_path else f"untitled{MODEL_EXT}"
+        path = filedialog.asksaveasfilename(
+            parent=self.root,
+            title="Save Model As",
+            initialdir=self._model_dir(),
+            initialfile=initial,
+            defaultextension=MODEL_EXT,
+            filetypes=[(f"{APP_NAME} model", f"*{MODEL_EXT}")],
+        )
+        if not path:
+            return False
+        if not path.lower().endswith(MODEL_EXT):
+            path += MODEL_EXT
+        return self.save_model_to(path)
+
+    def save_model_to(self, path):
+        try:
+            write_model(path, self.model_data())
+        except OSError as exc:
+            self.set_status(f"Could not save {os.path.basename(path)}: {exc}", "error")
+            messagebox.showerror("Save Failed", f"Could not save {os.path.basename(path)}:\n\n{exc}", parent=self.root)
+            return False
+        self.model_path = os.path.abspath(path)
+        self._set_dirty(False)
+        self._update_title()
+        self._remember_model_path()
+        self.set_status(f"Saved model {os.path.basename(path)} in {os.path.dirname(self.model_path)}", "ok")
+        return True
+
+    def _remember_model_path(self):
+        add_recent_file(self.config, self.model_path)
+        self.config["last_model_dir"] = os.path.dirname(self.model_path)
+        self._save_config()
+        self._rebuild_recent_menu()
+
+    def _mac_open_document(self, *paths):
+        for path in paths:
+            if path.lower().endswith(MODEL_EXT):
+                self.open_model_path(path)
+                break
+
+    def quit_app(self):
+        if not self.confirm_discard():
+            return
+        self._save_config()
+        self.root.destroy()
+
+    # ==================================================================
+    # About / project page / config folder
+    # ==================================================================
+    def show_about(self):
+        inst = self.config.get("install", {})
+        installed = f"yes — version {inst.get('version')}" if inst.get("installed") else "no (running from this folder)"
+        choice = ChoiceDialog.ask(
+            self.root,
+            APP_NAME,
+            f"Version {__version__}\n\nDraw the top, side and front views of a structure and export it as an "
+            "Ansys Lumerical script (.lsf), GDSII layout (.gds) or gdsfactory script (.py).",
+            [("ok", "OK", "primary"), ("updates", "Check for Updates", "secondary"), ("web", "Project page", "secondary")],
+            default="ok",
+            cancel_key="ok",
+            detail=f"Project:  {PROJECT_URL}\nProgram:  {os.path.abspath(__file__)}\n"
+            f"Settings:  {config_path()}\nInstalled for this user:  {installed}",
+        )
+        if choice == "updates":
+            self.check_for_updates(manual=True)
+        elif choice == "web":
+            self.open_project_page()
+
+    def open_project_page(self, url=PROJECT_URL):
+        import webbrowser
+
+        webbrowser.open(url)
+
+    def open_config_folder(self):
+        folder = config_dir()
+        os.makedirs(folder, exist_ok=True)
+        if not os.path.exists(config_path()):
+            self._save_config()
+        opener = "open" if sys.platform == "darwin" else ("explorer" if sys.platform.startswith("win") else "xdg-open")
+        try:
+            subprocess.Popen([opener, folder])
+        except OSError:
+            messagebox.showinfo("Configuration Folder", folder, parent=self.root)
+
+    # ==================================================================
+    # Updates
+    # ==================================================================
+    def _toggle_update_check(self):
+        self.config["check_updates_on_start"] = bool(self.check_updates_var.get())
+        self._save_config()
+
+    def check_for_updates(self, manual=False):
+        """Asks GitHub for the latest version in a background thread; offers an update if newer."""
+        if getattr(self, "_update_checking", False):
+            return
+        self._update_checking = True
+        self._update_result = None
+
+        def worker():
+            try:
+                self._update_result = ("ok", fetch_latest_version())
+            except Exception as exc:  # network / parse problems are reported, never fatal
+                self._update_result = ("error", exc)
+
+        threading.Thread(target=worker, daemon=True).start()
+        if manual:
+            self.set_status("Checking for updates…")
+        self.root.after(200, lambda: self._poll_update_check(manual))
+
+    def _poll_update_check(self, manual):
+        if self._update_result is None:
+            self.root.after(200, lambda: self._poll_update_check(manual))
+            return
+        kind, value = self._update_result
+        self._update_checking = False
+        self._update_result = None
+        self.config["last_update_check"] = time.time()
+        self._save_config()
+
+        if kind == "error":
+            if manual:
+                self.set_status("Update check failed.", "warn")
+                messagebox.showwarning(
+                    "Update Check Failed", f"Could not get the latest version from GitHub:\n\n{value}", parent=self.root
+                )
+            return
+        latest = value["version"]
+        if is_newer_version(latest):
+            if manual or self.config.get("skipped_version") != latest:
+                self.set_status(f"Version {latest} is available (you have {__version__}).", "warn")
+                self._offer_update(value)
+        elif manual:
+            self.set_status(f"{APP_NAME} {__version__} is up to date.", "ok")
+            messagebox.showinfo(
+                "No Update Available", f"You have the latest version of {APP_NAME} ({__version__}).", parent=self.root
+            )
+
+    def _update_targets(self):
+        """Program files an update should replace: this copy (unless it is a git checkout) and the installed copy."""
+        targets = []
+        here = os.path.abspath(__file__)
+        if not is_git_checkout(here):
+            targets.append(here)
+        installed = os.path.join(installed_app_dir(), UPDATE_FILE)
+        if self.config.get("install", {}).get("installed") and os.path.exists(installed):
+            if os.path.abspath(installed) not in targets:
+                targets.append(os.path.abspath(installed))
+        return targets
+
+    def _offer_update(self, info):
+        targets = self._update_targets()
+        notes = info.get("notes") or ""
+        if len(notes) > 700:
+            notes = notes[:700].rstrip() + " …"
+        detail = (notes + "\n\n") if notes else ""
+        if targets:
+            detail += "The update replaces:\n" + "\n".join(targets)
+        if is_git_checkout(__file__):
+            detail += ("\n\n" if targets else "") + "This copy is a git working tree — update it with  git pull."
+        buttons = [("install", "Install update", "primary")] if targets else []
+        buttons += [("web", "View on GitHub", "secondary"), ("skip", "Skip this version", "secondary"), ("later", "Later", "secondary")]
+        choice = ChoiceDialog.ask(
+            self.root,
+            "Update available",
+            f"{APP_NAME} {info['version']} is available — you have {__version__}.",
+            buttons,
+            default=buttons[0][0],
+            cancel_key="later",
+            detail=detail,
+            width=520,
+        )
+        if choice == "install":
+            self._install_update(info, targets)
+        elif choice == "web":
+            self.open_project_page(info.get("page") or PROJECT_URL)
+        elif choice == "skip":
+            self.config["skipped_version"] = info["version"]
+            self._save_config()
+
+    def _install_update(self, info, targets):
+        self.set_status(f"Downloading {APP_NAME} {info['version']}…")
+        self.root.config(cursor="watch")
+        self.root.update_idletasks()
+        try:
+            text, version = download_update(info["ref"], info["version"])
+            backups = [apply_update(text, target) for target in targets]
+        except Exception as exc:
+            self.set_status("Update failed.", "error")
+            messagebox.showerror("Update Failed", f"The update could not be installed:\n\n{exc}", parent=self.root)
+            return
+        finally:
+            self.root.config(cursor="")
+        if self.config.get("install", {}).get("installed"):
+            self.config["install"]["version"] = version
+        self.config["skipped_version"] = None
+        self._save_config()
+        self.set_status(f"Updated to {version}. Restart to use the new version.", "ok")
+        restart = messagebox.askyesno(
+            "Update Installed",
+            f"{APP_NAME} {version} was installed.\n\nPrevious version saved as:\n{backups[0]}\n\nRestart now?",
+            parent=self.root,
+        )
+        if restart and self.confirm_discard():
+            self._save_config()
+            self.root.destroy()
+            args = [sys.executable, targets[0]] + ([self.model_path] if self.model_path else [])
+            os.execv(sys.executable, args)
+
+    # ==================================================================
+    # First start: per-user installation
+    # ==================================================================
+    def _run_startup_tasks(self):
+        inst = self.config.get("install", {})
+        if (
+            inst.get("prompt", True)
+            and not inst.get("installed")
+            and (sys.platform == "darwin" or sys.platform.startswith("linux"))
+            and not is_running_installed_copy()
+        ):
+            self.offer_install(first_start=True)
+        if self.config.get("check_updates_on_start", True):
+            last = self.config.get("last_update_check") or 0
+            if time.time() - float(last) > UPDATE_CHECK_INTERVAL_S:
+                self.check_for_updates(manual=False)
+
+    def offer_install(self, first_start=False):
+        if sys.platform == "darwin":
+            where = f"~/Applications/{APP_NAME}.app (Launchpad, Spotlight, Dock)"
+        elif sys.platform.startswith("linux"):
+            where = "an entry in your applications menu and the '3dgg' command in ~/.local/bin"
+        else:
+            messagebox.showinfo("Install", "Installation is available on macOS and Linux only.", parent=self.root)
+            return
+        reinstall = bool(self.config.get("install", {}).get("installed"))
+        buttons = [("install", "Reinstall" if reinstall else "Install", "primary"), ("later", "Not now", "secondary")]
+        if first_start:
+            buttons.append(("never", "Don't ask again", "secondary"))
+        choice = ChoiceDialog.ask(
+            self.root,
+            f"Welcome to {APP_NAME} {__version__}" if first_start else f"Install {APP_NAME}",
+            f"{'Reinstall' if reinstall else 'Install'} {APP_NAME} for your user account?",
+            buttons,
+            default="install",
+            cancel_key="later",
+            detail=f"Copies the program to ~/{CONFIG_DIRNAME}/app and adds {where}, with its icon and the "
+            f"{MODEL_EXT} file type. No administrator rights are needed.\n\nSettings: {config_path()}",
+            width=500,
+        )
+        if choice == "install":
+            self.install_application()
+        elif choice == "never":
+            self.config["install"]["prompt"] = False
+            self._save_config()
+
+    def install_application(self):
+        try:
+            info = install_app()
+        except (OSError, GeometryError) as exc:
+            self.set_status("Installation failed.", "error")
+            messagebox.showerror("Installation Failed", str(exc), parent=self.root)
+            return
+        self.config["install"].update(
+            installed=True,
+            prompt=False,
+            version=__version__,
+            date=datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
+            app_dir=info["app_dir"],
+            paths=info["paths"],
+        )
+        self._save_config()
+        self._refresh_install_menu()
+        self.set_status(f"Installed {APP_NAME} {__version__} — {info['launcher']}", "ok")
+        how = (
+            f"Start it from Launchpad / Spotlight or\n{info['launcher']}"
+            if sys.platform == "darwin"
+            else f"Start it from the applications menu or with\n{info['launcher']}"
+        )
+        messagebox.showinfo("Installed", f"{APP_NAME} {__version__} is installed.\n\n{how}", parent=self.root)
+
+    def uninstall_application(self):
+        inst = self.config.get("install", {})
+        if not inst.get("installed"):
+            messagebox.showinfo("Uninstall", f"{APP_NAME} is not installed for this user.", parent=self.root)
+            return
+        if not messagebox.askyesno(
+            "Uninstall",
+            f"Remove the installed {APP_NAME}?\n\n" + "\n".join(inst.get("paths", []))
+            + f"\n\nYour models and {config_path()} are kept.",
+            parent=self.root,
+        ):
+            return
+        try:
+            uninstall_app(inst.get("paths", []))
+        except OSError as exc:
+            messagebox.showerror("Uninstall Failed", str(exc), parent=self.root)
+            return
+        inst.update(installed=False, version=None, date=None, app_dir=None, paths=[])
+        self._save_config()
+        self._refresh_install_menu()
+        self.set_status(f"{APP_NAME} was uninstalled for this user.", "ok")
 
     STATUS_COLORS = {"info": "accent", "ok": "success", "warn": "warning", "error": "danger"}
 
@@ -2113,6 +3270,7 @@ class LumericalGeometryApp:
 
     def _on_geometry_changed(self):
         """Called by the 2D views whenever points are added, moved, deleted or replaced."""
+        self._set_dirty(True)
         if self.geometry is not None and not self.geometry_outdated:
             self.geometry_outdated = True
             self.view_3d.set_state("outdated")
@@ -2163,16 +3321,18 @@ class LumericalGeometryApp:
     # ==================================================================
     # 3D Geometry Reconstruction from the Three 2D Views
     # ==================================================================
-    def generate_geometry(self):
+    def generate_geometry(self, quiet=False):
         """
         Reconstructs the 3D solid from the current 2D views and renders it in the
-        3D view. Returns the Geometry3D, or None if the views are incomplete.
+        3D view. Returns the Geometry3D, or None if the views are incomplete
+        (quiet=True: report only in the status bar, no dialog).
         """
         try:
             geom = reconstruct_geometry(self.view_xy.points, self.view_xz.points, self.view_yz.points)
         except GeometryError as exc:
             self.set_status(f"Cannot generate geometry: {exc}", "error")
-            messagebox.showwarning("Cannot Generate Geometry", str(exc))
+            if not quiet:
+                messagebox.showwarning("Cannot Generate Geometry", str(exc))
             return None
 
         # Mark all 3 views as closed polygons so subsequent clicks edit nicely
@@ -2229,12 +3389,19 @@ class LumericalGeometryApp:
             ".gds": ("GDSII Layout Files", "*.gds"),
             ".py": ("gdsfactory Python Scripts", "*.py"),
         }
-        default_dir = os.path.dirname(os.path.abspath(__file__))
+        # Default: next to the model (named like it), else the last export folder
+        last_export = self.config.get("last_export_dir")
+        if self.model_path:
+            default_dir = os.path.dirname(self.model_path)
+            default_name = os.path.splitext(os.path.basename(self.model_path))[0]
+        else:
+            default_dir = last_export if last_export and os.path.isdir(last_export) else self._model_dir()
+            default_name = "generate_structure"
         file_path = filedialog.asksaveasfilename(
             parent=self.root,
             title=f"Save {fmt_label}" + (" — base name for all files" if len(exts) > 1 else ""),
             initialdir=default_dir,
-            initialfile="generate_structure" + exts[0],
+            initialfile=default_name + exts[0],
             defaultextension=exts[0],
             filetypes=[file_types[e] for e in exts] + [("All Files", "*.*")],
         )
@@ -2269,6 +3436,8 @@ class LumericalGeometryApp:
             return
 
         folder = os.path.dirname(targets[0])
+        self.config["last_export_dir"] = folder
+        self._save_config()
         self.set_status(f"Saved {', '.join(os.path.basename(t) for t in targets)} to {folder}", "ok")
         note = ""
         if ".py" in exts:
@@ -2287,7 +3456,13 @@ def export_preset_cli(paths, cell_name, layer_text):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__.split("\n")[1])
+    if argv is None:
+        argv = sys.argv[1:]
+    argv = [a for a in argv if not a.startswith("-psn_")]  # old macOS Finder launch argument
+
+    parser = argparse.ArgumentParser(prog="geometry_gui.py", description=__doc__.split("\n")[1].strip())
+    parser.add_argument("model", nargs="?", help=f"{MODEL_EXT} model file to open")
+    parser.add_argument("--version", action="version", version=f"{APP_NAME} {__version__}")
     parser.add_argument(
         "--export-preset",
         nargs="+",
@@ -2296,6 +3471,9 @@ def main(argv=None):
     )
     parser.add_argument("--layer", default="1/0", help="GDS layer/datatype (default: 1/0)")
     parser.add_argument("--cell", default=DEFAULT_CELL_NAME, help=f"GDS cell name (default: {DEFAULT_CELL_NAME})")
+    parser.add_argument("--install", action="store_true", help="install for the current user (macOS / Linux) and exit")
+    parser.add_argument("--uninstall", action="store_true", help="remove the per-user installation and exit")
+    parser.add_argument("--check-updates", action="store_true", help="print whether a newer version exists and exit")
     args = parser.parse_args(argv)
 
     if args.export_preset:
@@ -2305,8 +3483,45 @@ def main(argv=None):
             parser.error(str(exc))
         return
 
-    root = tk.Tk()
-    LumericalGeometryApp(root)
+    cfg, existed = load_config()
+    if args.install or args.uninstall:
+        try:
+            if args.install:
+                info = install_app()
+                cfg["install"].update(
+                    installed=True,
+                    prompt=False,
+                    version=__version__,
+                    date=datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
+                    app_dir=info["app_dir"],
+                    paths=info["paths"],
+                )
+                print(f"Installed {APP_NAME} {__version__}:")
+                print("\n".join("  " + p for p in info["paths"]))
+            else:
+                removed = uninstall_app(cfg["install"].get("paths", []))
+                cfg["install"].update(installed=False, version=None, date=None, app_dir=None, paths=[])
+                print("Removed:\n" + "\n".join("  " + p for p in removed) if removed else "Nothing to remove.")
+        except GeometryError as exc:
+            parser.error(str(exc))
+        save_config(cfg)
+        return
+    if args.check_updates:
+        try:
+            info = fetch_latest_version()
+        except Exception as exc:  # network or GitHub problem
+            parser.exit(1, f"Update check failed: {exc}\n")
+        newer = is_newer_version(info["version"])
+        print(f"Installed: {__version__}   Latest on GitHub: {info['version']}" + ("   -> update available" if newer else ""))
+        return
+
+    if not existed:
+        save_config(cfg)  # first start: create ~/.3dgg/config.json
+
+    root = tk.Tk(className="3dgg")
+    app = LumericalGeometryApp(root, config=cfg, startup_tasks=True)
+    if args.model:
+        root.after(100, lambda: app.open_model_path(args.model, confirm=False))
     root.mainloop()
 
 
