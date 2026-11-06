@@ -11,7 +11,9 @@ Opens a window divided into four quadrants:
 
 Features:
   - Draw connected polygon points with the mouse pointer in each 2D view
-    (Top x-y, Side x-z, Front y-z).
+    (Top x-y, Side x-z, Front y-z). The top view gives the width along x, the
+    side view the thickness along x, and the front view the cross-section
+    shape, which is stretched at every x to the local width and thickness.
   - Modify points at any time after drawing:
       * Drag any vertex with the left mouse button to move it.
       * Click and drag on any polygon edge midpoint (or Shift+click an edge)
@@ -42,8 +44,9 @@ Usage:
     python geometry_gui.py --install | --uninstall | --check-updates | --version
 """
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 APP_NAME = "3D Geometry Generation"
+APP_SHORT_NAME = "3D Geometry Gen"  # macOS menu bar (CFBundleName, max. ~15 characters)
 
 import argparse
 import datetime
@@ -112,6 +115,11 @@ class Geometry3D:
     segments: list  # longitudinal sections (dicts with x0, x1, y*_bot/top, z*_bot/top)
     faces: list  # [(vertices, kind), ...] for the 3D preview
     bbox: tuple  # (xmin, xmax, ymin, ymax, zmin, zmax)
+    section: list = None  # Front-view cross-section, normalized to [0, 1] x [0, 1] (counter-clockwise)
+
+    @property
+    def section_is_rect(self):
+        return self.section is None or section_is_rectangle(self.section)
 
     @property
     def z_span(self):
@@ -189,11 +197,86 @@ def interval_slice_bounds(poly_pts, a, b):
     return (lo[1], hi[1]), (lo[2], hi[2])
 
 
+def _segments_cross(p1, p2, p3, p4):
+    """True if the segments p1-p2 and p3-p4 properly cross (touching ends do not count)."""
+
+    def orient(a, b, c):
+        return (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+
+    d1, d2 = orient(p3, p4, p1), orient(p3, p4, p2)
+    d3, d4 = orient(p1, p2, p3), orient(p1, p2, p4)
+    return d1 * d2 < 0 and d3 * d4 < 0
+
+
+def normalized_cross_section(yz_pts):
+    """
+    Turns the Front view (y-z) polygon into the cross-section shape used along x:
+    its points scaled to the unit square [0, 1] x [0, 1] of its bounding box,
+    counter-clockwise in the (y, z) plane, without duplicate or collinear points.
+    Raises GeometryError for a degenerate or self-crossing outline.
+    """
+    ys = [p[0] for p in yz_pts]
+    zs = [p[1] for p in yz_pts]
+    y0, z0 = min(ys), min(zs)
+    wy, wz = max(ys) - y0, max(zs) - z0
+    if wy < 1e-9 or wz < 1e-9:
+        raise GeometryError("The Front view (y-z) polygon has zero area (all points on one line).")
+    pts = []
+    for y, z in yz_pts:
+        p = ((y - y0) / wy, (z - z0) / wz)
+        if not pts or math.hypot(p[0] - pts[-1][0], p[1] - pts[-1][1]) > 1e-9:
+            pts.append(p)
+    if len(pts) > 1 and math.hypot(pts[0][0] - pts[-1][0], pts[0][1] - pts[-1][1]) <= 1e-9:
+        pts.pop()
+    changed = True
+    while changed and len(pts) > 3:  # drop points that lie on a straight edge
+        changed = False
+        for i in range(len(pts)):
+            a, b, c = pts[i - 1], pts[i], pts[(i + 1) % len(pts)]
+            if abs((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])) < 1e-12:
+                del pts[i]
+                changed = True
+                break
+    n = len(pts)
+    for i in range(n):
+        for j in range(i + 2, n):
+            if i == 0 and j == n - 1:
+                continue  # neighbouring edges
+            if _segments_cross(pts[i], pts[(i + 1) % n], pts[j], pts[(j + 1) % n]):
+                raise GeometryError(
+                    "The Front view (y-z) outline crosses itself. Please move the points so that "
+                    "the cross-section is a simple polygon."
+                )
+    if abs(polygon_area(pts)) < 1e-9:
+        raise GeometryError("The Front view (y-z) polygon has zero area (all points on one line).")
+    if polygon_area(pts) < 0:
+        pts.reverse()
+    return [(round(s, 12), round(t, 12)) for s, t in pts]
+
+
+def section_is_rectangle(section):
+    """True when a normalized cross-section is the full unit square (plain rectangular waveguide)."""
+    return len(section) == 4 and {(round(s, 9), round(t, 9)) for s, t in section} == {
+        (0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)
+    }
+
+
+def section_points_3d(section, x, y_bot, y_top, z_bot, z_top):
+    """Places the normalized cross-section at x, stretched to the local width and height."""
+    return [(x, y_bot + s * (y_top - y_bot), z_bot + t * (z_top - z_bot)) for s, t in section]
+
+
 def reconstruct_geometry(xy_pts, xz_pts, yz_pts):
     """
-    Combines the Top (x-y), Side (x-z) and Front (y-z) polygons into 3D
-    longitudinal segments (one per pair of neighbouring x-vertices of the top
-    view) and preview faces. Raises GeometryError for incomplete/degenerate input.
+    Combines the three views into a 3D solid:
+      * Top view (x-y):   width y_bot(x) .. y_top(x) along x (absolute),
+      * Side view (x-z):  thickness z_bot(x) .. z_top(x) along x (its x-range is
+                          stretched onto the x-range of the top view),
+      * Front view (y-z): the cross-section shape, stretched at every x to the
+                          local width and thickness from the other two views.
+    The solid is split into longitudinal segments at every x-vertex of the top
+    and side views; within a segment all bounds vary linearly.
+    Raises GeometryError for incomplete/degenerate input.
     """
     missing = [
         name
@@ -213,16 +296,11 @@ def reconstruct_geometry(xy_pts, xz_pts, yz_pts):
         )
     if abs(polygon_area(xy_pts)) < 1e-9:
         raise GeometryError("The Top view (x-y) polygon has zero area (all points on one line).")
+    if abs(polygon_area(xz_pts)) < 1e-12:
+        raise GeometryError("The Side view (x-z) polygon has zero area (all points on one line).")
+    section = normalized_cross_section(yz_pts)
 
-    # 1. z bounds from Side (x-z) and Front (y-z)
-    xz_zs = [p[1] for p in xz_pts]
-    yz_zs = [p[1] for p in yz_pts]
-    z_min_global = 0.5 * (min(xz_zs) + min(yz_zs))
-    z_max_global = 0.5 * (max(xz_zs) + max(yz_zs))
-    if abs(z_max_global - z_min_global) < 1e-6:
-        z_min_global, z_max_global = -0.125, 0.125
-
-    # 2. Unique sorted x stations of the Top view. Only (near-)coincident
+    # 1. x stations: every x-vertex of the top view. Only (near-)coincident
     #    x-values are merged so that short features are not distorted.
     x_stations = []
     for x_val in sorted(p[0] for p in xy_pts):
@@ -230,62 +308,68 @@ def reconstruct_geometry(xy_pts, xz_pts, yz_pts):
             x_stations.append(x_val)
     if len(x_stations) < 2:
         raise GeometryError("The Top view (x-y) polygon has no extent along x.")
+    xy_xmin, xy_xmax = x_stations[0], x_stations[-1]
 
-    # Map the x-z polygon's x-range onto the top view so local z(x) variations are respected
+    # 2. The side view's x-range is mapped onto the top view; its vertices add stations
     xz_xmin = min(p[0] for p in xz_pts)
     xz_xmax = max(p[0] for p in xz_pts)
-    xy_xmin, xy_xmax = x_stations[0], x_stations[-1]
-    xz_span = max(xz_zs) - min(xz_zs)
-    yz_span = max(yz_zs) - min(yz_zs)
+    xz_has_x = xz_xmax - xz_xmin > 1e-6
+    if xz_has_x:
+        to_xy = (xy_xmax - xy_xmin) / (xz_xmax - xz_xmin)
+        for u in {p[0] for p in xz_pts}:
+            x_val = xy_xmin + (u - xz_xmin) * to_xy
+            if all(abs(x_val - xs) > X_MERGE_TOL_UM for xs in x_stations):
+                x_stations.append(x_val)
+        x_stations.sort()
+    xz_zs = [p[1] for p in xz_pts]
 
-    def z_bounds_at_x(x_val):
-        if xz_xmax - xz_xmin > 1e-6:
-            u_mapped = xz_xmin + (x_val - xy_xmin) / (xy_xmax - xy_xmin) * (xz_xmax - xz_xmin)
-            zb, zt = vertical_slice_bounds(xz_pts, u_mapped)
-            # Scale by the Front view z-span if the user modified it
-            if xz_span > 1e-6 and yz_span > 1e-6:
-                z_center = 0.5 * (zb + zt)
-                half_h = 0.5 * (zt - zb) * (yz_span / xz_span)
-                return z_center - half_h, z_center + half_h
-            return zb, zt
-        return z_min_global, z_max_global
+    def z_bounds(x0, x1):
+        if not xz_has_x:
+            return (min(xz_zs), max(xz_zs)), (min(xz_zs), max(xz_zs))
+        u0 = xz_xmin + (x0 - xy_xmin) / to_xy
+        u1 = xz_xmin + (x1 - xy_xmin) / to_xy
+        return interval_slice_bounds(xz_pts, u0, u1)
 
     segments = []
-    faces_3d = []
     for x0, x1 in zip(x_stations[:-1], x_stations[1:]):
         (y0_bot, y0_top), (y1_bot, y1_top) = interval_slice_bounds(xy_pts, x0, x1)
-        # The side view has its own vertices, so it is sampled just inside the section
-        eps = min(1e-4, 0.01 * (x1 - x0))
-        z0_bot, z0_top = z_bounds_at_x(x0 + eps)
-        z1_bot, z1_top = z_bounds_at_x(x1 - eps)
+        (z0_bot, z0_top), (z1_bot, z1_top) = z_bounds(x0, x1)
+        segments.append(
+            {
+                k: round(v, 6)
+                for k, v in (
+                    ("x0", x0), ("x1", x1),
+                    ("y0_bot", y0_bot), ("y0_top", y0_top),
+                    ("y1_bot", y1_bot), ("y1_top", y1_top),
+                    ("z0_bot", z0_bot), ("z0_top", z0_top),
+                    ("z1_bot", z1_bot), ("z1_top", z1_top),
+                )
+            }
+        )
 
-        seg = {
-            k: round(v, 6)
-            for k, v in (
-                ("x0", x0), ("x1", x1),
-                ("y0_bot", y0_bot), ("y0_top", y0_top),
-                ("y1_bot", y1_bot), ("y1_top", y1_top),
-                ("z0_bot", z0_bot), ("z0_top", z0_top),
-                ("z1_bot", z1_bot), ("z1_top", z1_top),
-            )
-        }
-        segments.append(seg)
-
-        # 8 corners of the hexahedral segment
-        b0 = (x0, y0_bot, z0_bot)
-        b1 = (x1, y1_bot, z1_bot)
-        b2 = (x1, y1_top, z1_bot)
-        b3 = (x0, y0_top, z0_bot)
-        t0 = (x0, y0_bot, z0_top)
-        t1 = (x1, y1_bot, z1_top)
-        t2 = (x1, y1_top, z1_top)
-        t3 = (x0, y0_top, z0_top)
-        faces_3d.append(([b0, b1, b2, b3], "bottom"))
-        faces_3d.append(([t0, t1, t2, t3], "top"))
-        faces_3d.append(([b0, b1, t1, t0], "side"))
-        faces_3d.append(([b3, b2, t2, t3], "side"))
-        faces_3d.append(([b0, b3, t3, t0], "end"))
-        faces_3d.append(([b1, b2, t2, t1], "end"))
+    # 3. Preview faces: one quad per cross-section edge and segment, plus end
+    #    caps where the cross-section starts, ends or jumps.
+    faces_3d = []
+    n = len(section)
+    prev_end = None
+    for idx, seg in enumerate(segments):
+        start = section_points_3d(section, seg["x0"], seg["y0_bot"], seg["y0_top"], seg["z0_bot"], seg["z0_top"])
+        end = section_points_3d(section, seg["x1"], seg["y1_bot"], seg["y1_top"], seg["z1_bot"], seg["z1_top"])
+        for i in range(n):
+            j = (i + 1) % n
+            ds, dt = section[j][0] - section[i][0], section[j][1] - section[i][1]
+            # outward normal of a counter-clockwise edge is (dt, -ds)
+            kind = "top" if -ds > abs(dt) else "bottom" if ds > abs(dt) else "side"
+            faces_3d.append(([start[i], start[j], end[j], end[i]], kind))
+        if prev_end is None or any(
+            max(abs(a - b) for a, b in zip(p, q)) > 1e-9 for p, q in zip(prev_end, start)
+        ):
+            faces_3d.append((start[::-1], "end"))
+            if prev_end is not None:
+                faces_3d.append((prev_end, "end"))
+        if idx == len(segments) - 1:
+            faces_3d.append((end, "end"))
+        prev_end = end
 
     all_v = [v for f, _ in faces_3d for v in f]
     bbox = tuple(
@@ -298,12 +382,89 @@ def reconstruct_geometry(xy_pts, xz_pts, yz_pts):
         segments=segments,
         faces=faces_3d,
         bbox=bbox,
+        section=section,
     )
 
 
 # ----------------------------------------------------------------------
 # Ansys Lumerical (.lsf)
 # ----------------------------------------------------------------------
+_LSF_GROUP_HEADER = [
+    "# -------------------------------------------------------------------------",
+    "# 2. Build 3D Geometry inside 'InP_Structure' Group",
+    "# -------------------------------------------------------------------------",
+    "addstructuregroup;",
+    'set("name", "InP_Structure");',
+    'set("x", 0);',
+    'set("y", 0);',
+    'set("z", 0);',
+    "",
+]
+
+
+def _lsf_planar_solids(geom):
+    """
+    Script lines for a non-rectangular Front-view cross-section: one Lumerical
+    planar solid (closed triangle/polygon mesh) per longitudinal section.
+    Facet vertices are ordered counter-clockwise seen from outside.
+    """
+    f = fmt_num
+    sec = geom.section
+    n = len(sec)
+    lines = [
+        f"# Cross-section from the Front view (y-z): {n}-point outline, normalized to its",
+        "# bounding box and stretched to the local width (Top view) and thickness (Side view):",
+        "#   " + "  ".join(f"({f(s_)}, {f(t_)})" for s_, t_ in sec),
+        "",
+    ] + _LSF_GROUP_HEADER
+
+    facets = [list(range(n, 0, -1)), list(range(n + 1, 2 * n + 1))]  # start cap (-x), end cap (+x)
+    for i in range(n):
+        j = (i + 1) % n
+        facets.append([i + 1, j + 1, n + j + 1])
+        facets.append([i + 1, n + j + 1, n + i + 1])
+
+    for idx, seg in enumerate(geom.segments, start=1):
+        start = section_points_3d(sec, seg["x0"], seg["y0_bot"], seg["y0_top"], seg["z0_bot"], seg["z0_top"])
+        end = section_points_3d(sec, seg["x1"], seg["y1_bot"], seg["y1_top"], seg["z1_bot"], seg["z1_top"])
+        verts = start + end
+        len_tag = f"{round(seg['x1'] - seg['x0'], 3):g}".replace(".", "p")
+        lines.append(
+            f"# Section ({idx}): x=[{f(seg['x0'])}, {f(seg['x1'])}] um, "
+            f"width {f(seg['y0_top'] - seg['y0_bot'])} -> {f(seg['y1_top'] - seg['y1_bot'])} um, "
+            f"thickness {f(seg['z0_top'] - seg['z0_bot'])} -> {f(seg['z1_top'] - seg['z1_bot'])} um"
+        )
+        lines.append(f"V_sec_{idx} = [")
+        for k, (vx, vy, vz) in enumerate(verts):
+            sep = ";" if k < len(verts) - 1 else ""
+            lines.append(f"    {f(vx)}, {f(vy)}, {f(vz)}{sep}")
+        lines.append("] * um;")
+        lines.append(f"F_sec_{idx} = cell({len(facets)});")
+        for k, fac in enumerate(facets, start=1):
+            lines.append(f"F_sec_{idx}{{{k}}} = cell(1);  F_sec_{idx}{{{k}}}{{1}} = [{', '.join(map(str, fac))}];")
+        lines.extend(
+            [
+                f"addplanarsolid(V_sec_{idx}, F_sec_{idx});",
+                f'set("name", "section_{idx}_{len_tag}um");',
+                'set("material", mat_name);',
+                'addtogroup("InP_Structure");',
+                "",
+            ]
+        )
+
+    x_total = geom.segments[-1]["x1"] - geom.segments[0]["x0"]
+    z_min, z_max = geom.z_span
+    lines.extend(
+        [
+            f'?"3D InP structure successfully generated ({len(geom.segments)} planar solids, '
+            f'total x-length: {f(x_total)} um, max y-width: {f(geom.bbox[3] - geom.bbox[2])} um, '
+            f'z-thickness: {f((z_max - z_min) * 1000.0)} nm).";',
+            "",
+        ]
+    )
+    return lines
+
+
 def build_lsf(geom):
     """Builds the Ansys Lumerical .lsf script string from a reconstructed geometry."""
     f = fmt_num
@@ -347,21 +508,22 @@ def build_lsf(geom):
         "    }",
         "}",
         "",
-        "# Toggle: 0 = Individual longitudinal sections, 1 = Unified extruded polygon",
-        "use_single_polygon = 0;",
-        "",
-        "# -------------------------------------------------------------------------",
-        "# 2. Build 3D Geometry inside 'InP_Structure' Group",
-        "# -------------------------------------------------------------------------",
-        "addstructuregroup;",
-        'set("name", "InP_Structure");',
-        'set("x", 0);',
-        'set("y", 0);',
-        'set("z", 0);',
-        "",
-        "if (use_single_polygon == 1) {",
-        "    V_all = [",
     ]
+    if not geom.section_is_rect:
+        lines.extend(_lsf_planar_solids(geom))
+        return "\n".join(lines)
+    lines.extend(
+        [
+            "# Toggle: 0 = Individual longitudinal sections, 1 = Unified extruded polygon",
+            "use_single_polygon = 0;",
+            "",
+        ]
+        + _LSF_GROUP_HEADER
+        + [
+            "if (use_single_polygon == 1) {",
+            "    V_all = [",
+        ]
+    )
     n_poly = len(geom.xy_poly)
     for idx, (vx, vy) in enumerate(geom.xy_poly):
         sep = ";" if idx < n_poly - 1 else ""
@@ -606,6 +768,12 @@ def build_gdsfactory_script(geom, cell_name=DEFAULT_CELL_NAME, layer=DEFAULT_GDS
             "#       so only the overall z-range is stored in the LayerStack below.\n"
         )
     )
+    if not geom.section_is_rect:
+        z_note += (
+            "# NOTE: the Front view (y-z) defines a non-rectangular cross-section. GDS and the\n"
+            "#       LayerStack only describe the top-view outline and the thickness; the exact\n"
+            "#       3D shape is exported in the Lumerical script (.lsf, planar solids).\n"
+        )
 
     return f'''#!/usr/bin/env python3
 """
@@ -1063,7 +1231,7 @@ def _install_macos(home, python, script, app_dir, register):
 
     doc_name = f"{APP_NAME} model"
     plist = {
-        "CFBundleName": APP_NAME,
+        "CFBundleName": APP_SHORT_NAME,
         "CFBundleDisplayName": APP_NAME,
         "CFBundleIdentifier": BUNDLE_ID,
         "CFBundleVersion": __version__,
@@ -3186,7 +3354,32 @@ class LumericalGeometryApp:
             if sys.platform == "darwin"
             else f"Start it from the applications menu or with\n{info['launcher']}"
         )
+        if sys.platform == "darwin" and not is_running_installed_copy():
+            if messagebox.askyesno(
+                "Installed",
+                f"{APP_NAME} {__version__} is installed.\n\n{how}\n\n"
+                "This window still runs from the Python interpreter. "
+                "Switch to the installed app now?",
+                parent=self.root,
+            ):
+                self.switch_to_installed_app(info["launcher"])
+            return
         messagebox.showinfo("Installed", f"{APP_NAME} {__version__} is installed.\n\n{how}", parent=self.root)
+
+    def switch_to_installed_app(self, bundle):
+        """Opens the installed macOS app (with the current model) and closes this window."""
+        if not self.confirm_discard():
+            return
+        cmd = ["open", "-n", "-a", bundle]
+        if self.model_path and os.path.exists(self.model_path):
+            cmd.append(self.model_path)
+        try:
+            subprocess.Popen(cmd)
+        except OSError as exc:
+            messagebox.showerror("Could Not Start", str(exc), parent=self.root)
+            return
+        self._save_config()
+        self.root.destroy()
 
     def uninstall_application(self):
         inst = self.config.get("install", {})
@@ -3344,8 +3537,10 @@ class LumericalGeometryApp:
         self.geometry_outdated = False
 
         xmin, xmax, ymin, ymax, zmin, zmax = geom.bbox
+        section = "rectangle" if geom.section_is_rect else f"{len(geom.section)}-point outline"
         summary = (
             f"Material  InP     Sections  {len(geom.segments)}\n"
+            f"Cross-section  {section} (Front view)\n"
             f"x  [{xmin:g}, {xmax:g}] μm   L = {xmax - xmin:g} μm\n"
             f"y  [{ymin:g}, {ymax:g}] μm   W = {ymax - ymin:g} μm\n"
             f"z  [{zmin:g}, {zmax:g}] μm   T = {(zmax - zmin)*1000:g} nm"
@@ -3455,6 +3650,58 @@ def export_preset_cli(paths, cell_name, layer_text):
         print(f"{path}: {export_geometry(geom, path, cell_name, layer)}")
 
 
+def set_macos_app_name(name=APP_SHORT_NAME):
+    """
+    Makes the macOS menu bar show `name` instead of "Python" when the program is
+    started with the python interpreter. Must run before tk.Tk() is created.
+    Uses the Objective-C runtime through ctypes (no pyobjc needed); silently does
+    nothing if anything is unavailable.
+    """
+    if sys.platform != "darwin":
+        return False
+    try:
+        import ctypes
+        import ctypes.util
+
+        ctypes.cdll.LoadLibrary("/System/Library/Frameworks/Foundation.framework/Foundation")
+        objc = ctypes.cdll.LoadLibrary(ctypes.util.find_library("objc"))
+        objc.objc_getClass.restype = ctypes.c_void_p
+        objc.objc_getClass.argtypes = [ctypes.c_char_p]
+        objc.sel_registerName.restype = ctypes.c_void_p
+        objc.sel_registerName.argtypes = [ctypes.c_char_p]
+        send0 = ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p)(
+            ("objc_msgSend", objc)
+        )
+        send_str = ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_char_p)(
+            ("objc_msgSend", objc)
+        )
+        send2 = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p)(
+            ("objc_msgSend", objc)
+        )
+        sel = objc.sel_registerName
+
+        def nsstring(text):
+            return send_str(objc.objc_getClass(b"NSString"), sel(b"stringWithUTF8String:"), text.encode("utf-8"))
+
+        bundle = send0(objc.objc_getClass(b"NSBundle"), sel(b"mainBundle"))
+        changed = False
+        for getter in (b"localizedInfoDictionary", b"infoDictionary"):
+            info = send0(bundle, sel(getter))
+            if not info:
+                continue
+            mutable_cls = objc.objc_getClass(b"NSMutableDictionary")
+            is_kind = ctypes.CFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p)(
+                ("objc_msgSend", objc)
+            )
+            if not is_kind(info, sel(b"isKindOfClass:"), mutable_cls):
+                continue
+            send2(info, sel(b"setObject:forKey:"), nsstring(name), nsstring("CFBundleName"))
+            changed = True
+        return changed
+    except Exception:  # never block the start because of a cosmetic detail
+        return False
+
+
 def main(argv=None):
     if argv is None:
         argv = sys.argv[1:]
@@ -3518,6 +3765,7 @@ def main(argv=None):
     if not existed:
         save_config(cfg)  # first start: create ~/.3dgg/config.json
 
+    set_macos_app_name()
     root = tk.Tk(className="3dgg")
     app = LumericalGeometryApp(root, config=cfg, startup_tasks=True)
     if args.model:

@@ -85,6 +85,55 @@ def test_varying_thickness_is_detected():
     assert not geom.z_is_uniform
 
 
+def test_front_view_shape_changes_the_solid():
+    xy = [[0, 0], [20, 0], [20, 1], [0, 1]]
+    hexagon = [[0, 0], [-0.05, 0.02], [-0.05, -0.02], [0, -0.04], [0.05, -0.02], [0.05, 0.02]]
+    geom = gg.reconstruct_geometry(xy, RECT_XZ, hexagon)
+    assert not geom.section_is_rect
+    assert len(geom.section) == 6
+    moved = [list(p) for p in hexagon]
+    moved[0] = [0.0, -0.03]
+    assert gg.reconstruct_geometry(xy, RECT_XZ, moved).faces != geom.faces
+    # the cross-section is stretched to the local width (top view) and thickness (side view)
+    assert geom.bbox == pytest.approx((0, 20, 0, 1, -0.1, 0.1))
+
+
+def test_rectangular_front_view_gives_box_sections():
+    # extra collinear point on an edge is still a rectangle
+    yz = [[0, -0.1], [0.6, -0.1], [1.2, -0.1], [1.2, 0.1], [0, 0.1]]
+    geom = gg.reconstruct_geometry([[0, 0], [20, 0], [20, 1], [0, 1]], RECT_XZ, yz)
+    assert geom.section_is_rect
+    assert "addplanarsolid" not in gg.build_lsf(geom)
+
+
+def test_self_crossing_front_view_raises():
+    bow_tie = [[0, 0], [1, 1], [1, 0], [0, 1]]
+    with pytest.raises(gg.GeometryError, match="crosses itself"):
+        gg.reconstruct_geometry([[0, 0], [20, 0], [20, 1], [0, 1]], RECT_XZ, bow_tie)
+
+
+def test_side_view_vertices_become_stations():
+    xz = [[0, -0.1], [5, -0.2], [15, -0.2], [20, -0.1], [20, 0.1], [15, 0.2], [5, 0.2], [0, 0.1]]
+    geom = gg.reconstruct_geometry([[0, 0], [20, 0], [20, 1], [0, 1]], xz, RECT_YZ)
+    assert [(s["x0"], s["x1"]) for s in geom.segments] == [(0, 5), (5, 15), (15, 20)]
+    assert (geom.segments[1]["z0_bot"], geom.segments[1]["z0_top"]) == (-0.2, 0.2)
+
+
+def test_lsf_planar_solids_are_closed_and_outward():
+    xy = [[0, 0], [10, 0.2], [20, 0.2], [20, 0.8], [10, 0.8], [0, 1]]
+    hexagon = [[0, 0], [-0.05, 0.02], [-0.05, -0.02], [0, -0.04], [0.05, -0.02], [0.05, 0.02]]
+    geom = gg.reconstruct_geometry(xy, RECT_XZ, hexagon)
+    lsf = gg.build_lsf(geom)
+    assert lsf.count("addplanarsolid(") == len(geom.segments)
+    assert lsf.count("{") == lsf.count("}") and lsf.count("[") == lsf.count("]")
+    facets = [[int(i) for i in m.split(",")] for m in __import__("re").findall(r"F_sec_1\{\d+\}\{1\} = \[([^]]+)\]", lsf)]
+    edges = {}
+    for fc in facets:
+        for a, b in zip(fc, fc[1:] + fc[:1]):
+            edges[(a, b)] = edges.get((a, b), 0) + 1
+    assert all(c == 1 and edges.get((b, a)) == 1 for (a, b), c in edges.items())  # closed, consistently oriented
+
+
 # ----------------------------------------------------------------------
 # Lumerical
 # ----------------------------------------------------------------------
