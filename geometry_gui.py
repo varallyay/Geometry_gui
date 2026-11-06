@@ -20,6 +20,9 @@ Features:
         to insert a new vertex between connected points.
       * Right-click (or Ctrl+click / Delete key) on a vertex to remove it.
       * Edit exact numeric coordinates of the selected vertex in the toolbar.
+      * Undo / redo every change of the drawn points (Cmd/Ctrl+Z, Cmd+Shift+Z / Ctrl+Y).
+      * Mirror any view about its horizontal or vertical axis (⇅ / ⇆ in the view header).
+  - The grid, tick labels and snap step follow the zoom level.
   - "Generate geometry" button: Reconstructs the 3D solid from the three
     orthographic views and displays it in the 3D view.
   - "Generate file" button: Exports the drawn and reconstructed 3D geometry as
@@ -44,7 +47,7 @@ Usage:
     python geometry_gui.py --install | --uninstall | --check-updates | --version
 """
 
-__version__ = "0.3.1"
+__version__ = "0.3.2"
 APP_NAME = "3D Geometry Generation"
 APP_SHORT_NAME = "3D Geometry Gen"  # macOS menu bar (CFBundleName, max. ~15 characters)
 
@@ -264,6 +267,112 @@ def section_is_rectangle(section):
 def section_points_3d(section, x, y_bot, y_top, z_bot, z_top):
     """Places the normalized cross-section at x, stretched to the local width and height."""
     return [(x, y_bot + s * (y_top - y_bot), z_bot + t * (z_top - z_bot)) for s, t in section]
+
+
+# ----------------------------------------------------------------------
+# 2D view helpers (GUI independent): axis ticks and mirroring
+# ----------------------------------------------------------------------
+def nice_tick_step(span, pixels, min_px):
+    """Smallest 1/2/5 x 10^n step that keeps grid lines at least min_px pixels apart."""
+    raw = abs(span) * min_px / max(float(pixels), 1.0)
+    if not raw > 0 or math.isinf(raw):
+        return 1.0
+    mag = 10.0 ** math.floor(math.log10(raw))
+    for m in (1, 2, 5, 10):
+        if m * mag >= raw * (1 - 1e-12):
+            return m * mag
+    return 10 * mag
+
+
+def minor_tick_step(step):
+    """Minor grid / snap step: a quarter of a 2-step, a fifth of a 1- or 5-step."""
+    lead = round(step / 10.0 ** math.floor(math.log10(step) + 1e-12))
+    return step / (4 if lead == 2 else 5)
+
+
+def format_tick(value, step):
+    """Tick label with just enough decimals for the step (no float noise such as 0.30000000000000004)."""
+    decimals = max(0, -math.floor(math.log10(step) + 1e-9))
+    text = f"{round(value / step) * step:.{decimals}f}"
+    return "0" if float(text) == 0 else text
+
+
+def mirror_outline(points, closed=True, axis="v", eps=1e-9):
+    """
+    Makes a 2D outline symmetric about u = 0 (axis="u") or v = 0 (axis="v").
+    The half holding more points off the axis is kept (the positive half on a
+    tie) and mirrored onto the other side. Works for closed polygons crossing
+    or touching the axis, and for open profiles or closed outlines drawn on one
+    side only (e.g. the upper edge of a taper).
+    Returns (points, kept_sign) with kept_sign +1 / -1.
+    """
+    k = 1 if axis == "v" else 0
+    pts = [[float(p[0]), float(p[1])] for p in points]
+    for p in pts:
+        if abs(p[k]) <= eps:
+            p[k] = 0.0
+    if len(pts) < 2:
+        raise GeometryError("Draw at least 2 points before mirroring.")
+    pos = sum(1 for p in pts if p[k] > 0)
+    neg = sum(1 for p in pts if p[k] < 0)
+    if pos == 0 and neg == 0:
+        raise GeometryError("All points lie on the mirror axis.")
+    sign = 1 if pos >= neg else -1
+
+    def side(p):
+        return p[k] * sign  # > 0 on the kept side
+
+    def flip(p):
+        q = list(p)
+        q[k] = -q[k]
+        return q
+
+    # Clip to the kept half-plane (Sutherland-Hodgman); crossings land exactly on the axis
+    n = len(pts)
+    clipped = []
+    for i in range(n if closed else n - 1):
+        cur, nxt = pts[i], pts[(i + 1) % n]
+        if side(cur) >= 0:
+            clipped.append(cur)
+        if side(cur) * side(nxt) < 0:
+            t = cur[k] / (cur[k] - nxt[k])
+            q = [cur[0] + t * (nxt[0] - cur[0]), cur[1] + t * (nxt[1] - cur[1])]
+            q[k] = 0.0
+            clipped.append(q)
+    if not closed and side(pts[-1]) >= 0:
+        clipped.append(pts[-1])
+    chain = []
+    for p in clipped:
+        if not chain or max(abs(p[0] - chain[-1][0]), abs(p[1] - chain[-1][1])) > eps:
+            chain.append(p)
+    if closed and len(chain) > 1 and max(abs(chain[0][0] - chain[-1][0]), abs(chain[0][1] - chain[-1][1])) <= eps:
+        chain.pop()
+
+    # A closed outline that lies on the axis along one edge is opened at that edge
+    if closed:
+        m = len(chain)
+        for i in range(m):
+            if chain[i - 1][k] == 0.0 and chain[i][k] == 0.0:
+                chain = chain[i:] + chain[:i]
+                break
+
+    result = chain + [flip(p) for p in reversed(chain) if p[k] != 0.0]
+
+    # Drop axis points that only split a straight edge (e.g. at a vertical end face)
+    changed = True
+    while changed and len(result) > 3:
+        changed = False
+        for i in range(len(result)):
+            a, b, c = result[i - 1], result[i], result[(i + 1) % len(result)]
+            cross = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+            scale = math.hypot(c[0] - a[0], c[1] - a[1]) ** 2 or 1.0
+            if b[k] == 0.0 and abs(cross) <= 1e-12 * scale:
+                del result[i]
+                changed = True
+                break
+    if len(result) < 3:
+        raise GeometryError("Mirroring needs points away from the mirror axis.")
+    return [[round(u, 9), round(v, 9)] for u, v in result], sign
 
 
 def reconstruct_geometry(xy_pts, xz_pts, yz_pts):
@@ -1387,6 +1496,7 @@ THEME = {
     "border": "#2a303a",
     "plot_bg": "#12151a",      # 2D plot area
     "grid": "#1f242c",
+    "grid_minor": "#181c22",
     "grid_axis": "#3a414d",
     "guide": "#2f3742",
     "text": "#e6e9ef",
@@ -1663,10 +1773,10 @@ class OrthoCanvas2D(tk.Frame):
         v_range,
         u_guides=None,
         v_guides=None,
-        u_grid_step=50.0,
-        v_grid_step=0.25,
         on_point_selected=None,
         on_geometry_changed=None,
+        on_edit_finished=None,
+        on_mirror=None,
     ):
         super().__init__(parent, bg=THEME["panel_bg"], highlightthickness=1, highlightbackground=THEME["border"])
         self.title = title
@@ -1678,10 +1788,10 @@ class OrthoCanvas2D(tk.Frame):
         self.v_range = list(v_range)
         self.u_guides = u_guides or []
         self.v_guides = v_guides or []
-        self.u_grid_step = u_grid_step
-        self.v_grid_step = v_grid_step
         self.on_point_selected = on_point_selected
         self.on_geometry_changed = on_geometry_changed
+        self.on_edit_finished = on_edit_finished  # end of one undoable edit (e.g. mouse released)
+        self.on_mirror = on_mirror
 
         # Polygon state: list of [u, v] in physical units (micrometers)
         self.points = []
@@ -1724,20 +1834,32 @@ class OrthoCanvas2D(tk.Frame):
         self.coord_lbl = tk.Label(
             header,
             text="",
+            anchor="w",
             font=(FONT_MONO, 10),
             bg=THEME["panel_bg"],
             fg=THEME["text_muted"],
         )
-        self.coord_lbl.pack(side=tk.LEFT, padx=4)
 
         for text, cmd, tip in (
             ("Clear", self.clear_points, "Remove all points from this view"),
             ("Close shape", self.close_polygon, "Close the polygon and switch to edit mode\n(drag vertices, click an edge to insert a point)"),
             ("Fit", self.reset_view, "Reset zoom / pan of this view"),
+            (
+                "⇆ Mirror",
+                lambda: self._mirror("u"),
+                f"Make the outline symmetric about {u_label} = 0:\nthe half with more points is mirrored onto the other side",
+            ),
+            (
+                "⇅ Mirror",
+                lambda: self._mirror("v"),
+                f"Make the outline symmetric about {v_label} = 0:\nthe half with more points is mirrored onto the other side",
+            ),
         ):
-            FlatButton(header, text, cmd, variant="ghost", size=10, padx=8, pady=3, tooltip=tip).pack(
-                side=tk.RIGHT, padx=(0, 4) if text != "Clear" else (0, 8), pady=4
+            FlatButton(header, text, cmd, variant="ghost", size=10, padx=7, pady=3, tooltip=tip).pack(
+                side=tk.RIGHT, padx=(0, 3) if text != "Clear" else (0, 8), pady=4
             )
+        # packed last: the cursor readout gives way first when the window is narrow
+        self.coord_lbl.pack(side=tk.LEFT, padx=4)
 
         # Drawing Canvas
         self.canvas = tk.Canvas(
@@ -1749,7 +1871,7 @@ class OrthoCanvas2D(tk.Frame):
         self.canvas.pack(fill=tk.BOTH, expand=True)
 
         # Margins for axis labels
-        self.margin_left = 54
+        self.margin_left = 64
         self.margin_right = 20
         self.margin_top = 20
         self.margin_bottom = 36
@@ -1802,7 +1924,7 @@ class OrthoCanvas2D(tk.Frame):
 
     def snap_uv(self, u, v, disable_snap=False):
         if not self.snap_enabled or disable_snap:
-            return round(u, 4), round(v, 4)
+            return round(u, 6), round(v, 6)
 
         u_span = self.u_range[1] - self.u_range[0]
         v_span = self.v_range[1] - self.v_range[0]
@@ -1812,18 +1934,25 @@ class OrthoCanvas2D(tk.Frame):
             best = min(guides, key=lambda g: abs(val - g), default=None)
             return best if best is not None and abs(val - best) <= tol else None
 
-        snapped_u = nearest_guide(u, self.u_guides, 0.025 * u_span)
+        # Guides catch the pointer within 12 px; otherwise snap to the minor grid of the current zoom
+        x0, y0, x1, y1 = self._plot_rect()
+        (_, fine_u), (_, fine_v) = self.tick_steps()
+        snapped_u = nearest_guide(u, self.u_guides, 12.0 * u_span / max(1.0, x1 - x0))
         if snapped_u is None:
-            # Snap to fine grid step
-            fine_u = self.u_grid_step / 5.0
             snapped_u = round(u / fine_u) * fine_u
 
-        snapped_v = nearest_guide(v, self.v_guides, 0.03 * v_span)
+        snapped_v = nearest_guide(v, self.v_guides, 12.0 * v_span / max(1.0, y1 - y0))
         if snapped_v is None:
-            fine_v = self.v_grid_step / 5.0
             snapped_v = round(v / fine_v) * fine_v
 
-        return round(snapped_u, 4), round(snapped_v, 4)
+        return round(snapped_u, 9), round(snapped_v, 9)
+
+    def tick_steps(self):
+        """((major, minor) along u, (major, minor) along v) for the current zoom and canvas size."""
+        x0, y0, x1, y1 = self._plot_rect()
+        su = nice_tick_step(self.u_range[1] - self.u_range[0], x1 - x0, 80)
+        sv = nice_tick_step(self.v_range[1] - self.v_range[0], y1 - y0, 40)
+        return (su, minor_tick_step(su)), (sv, minor_tick_step(sv))
 
     # ------------------------------------------------------------------
     # Hit testing for vertices and edges
@@ -1894,6 +2023,7 @@ class OrthoCanvas2D(tk.Frame):
             self.redraw()
 
     def _on_left_down(self, event):
+        self.canvas.focus_set()  # so Delete / Backspace act on the points, not on a text field
         disable_snap = bool(event.state & 0x0001)
         u, v = self.px_to_uv(event.x, event.y)
         su, sv = self.snap_uv(u, v, disable_snap=disable_snap)
@@ -1984,15 +2114,34 @@ class OrthoCanvas2D(tk.Frame):
         self.redraw()
 
     def _on_left_up(self, event):
+        was_dragging = self.dragging_idx is not None
         self.dragging_idx = None
         self.redraw()
+        if was_dragging:
+            self._edit_finished()
+
+    def _edit_finished(self):
+        if self.on_edit_finished:
+            self.on_edit_finished()
 
     def _on_double_click(self, event):
         if len(self.points) >= 3:
             self.closed = True
             self.redraw()
+            self._edit_finished()
+
+    def _mirror(self, axis):
+        if self.on_mirror:
+            self.on_mirror(self, axis)
+
+    def mirror(self, axis):
+        """Makes the outline symmetric about u = 0 (axis 'u') or v = 0 (axis 'v'). Returns the kept sign."""
+        pts, sign = mirror_outline(self.points, self.closed, axis)
+        self.set_points(pts, closed=True)
+        return sign
 
     def _on_right_click(self, event):
+        self.canvas.focus_set()
         v_idx = self._find_vertex_near(event.x, event.y, radius=12.0)
         if v_idx is not None:
             del self.points[v_idx]
@@ -2009,6 +2158,7 @@ class OrthoCanvas2D(tk.Frame):
             # Right-clicking empty space finishes/closes the current polygon
             self.closed = True
             self.redraw()
+        self._edit_finished()
 
     def _on_mousewheel(self, event):
         # Zoom around cursor position
@@ -2016,6 +2166,10 @@ class OrthoCanvas2D(tk.Frame):
         factor = 0.85 if event.delta > 0 else 1.18
         u_min, u_max = self.u_range
         v_min, v_max = self.v_range
+        # Limits: down to 1 nm across the view, out to 1000x the default view
+        spans = ((u_max - u_min, self.default_u_range), (v_max - v_min, self.default_v_range))
+        if any(sp * factor < 1e-3 or sp * factor > 1000 * (d[1] - d[0]) for sp, d in spans):
+            return
         self.u_range = [
             u_c - (u_c - u_min) * factor,
             u_c + (u_max - u_c) * factor,
@@ -2112,26 +2266,32 @@ class OrthoCanvas2D(tk.Frame):
         v_min, v_max = self.v_range
         tick_font = (FONT_UI, 9)
 
-        # 1. Regular grid lines (+ tick labels), zero axis emphasised
-        step_u = self.u_grid_step
-        u_val = math.ceil(u_min / step_u) * step_u
-        while u_val <= u_max + 1e-9:
-            px, _ = self.uv_to_px(u_val, 0)
-            if x0 <= px <= x1:
-                is_zero = abs(u_val) < 1e-9
-                c.create_line(px, y0, px, y1, fill=T["grid_axis"] if is_zero else T["grid"], width=1)
-                c.create_text(px, y1 + 12, text=f"{u_val:g}", font=tick_font, fill=T["text_muted"])
-            u_val += step_u
-
-        step_v = self.v_grid_step
-        v_val = math.ceil(v_min / step_v) * step_v
-        while v_val <= v_max + 1e-9:
-            _, py = self.uv_to_px(0, v_val)
-            if y0 <= py <= y1:
-                is_zero = abs(v_val) < 1e-9
-                c.create_line(x0, py, x1, py, fill=T["grid_axis"] if is_zero else T["grid"], width=1)
-                c.create_text(x0 - 6, py, text=f"{v_val:g}", font=tick_font, fill=T["text_muted"], anchor="e")
-            v_val += step_v
+        # 1. Grid adapted to the zoom: faint minor lines (= snap grid), major lines with
+        #    tick labels (1/2/5 x 10^n, kept ~80 px apart along u and ~40 px along v),
+        #    zero axis emphasised
+        (step_u, minor_u), (step_v, minor_v) = self.tick_steps()
+        for minor, step, lo, hi, vertical in (
+            (minor_u, step_u, u_min, u_max, True),
+            (minor_v, step_v, v_min, v_max, False),
+        ):
+            per_major = round(step / minor)
+            for i in range(math.ceil(lo / minor - 1e-9), math.floor(hi / minor + 1e-9) + 1):
+                val = i * minor
+                is_major = i % per_major == 0
+                if vertical:
+                    px, _ = self.uv_to_px(val, 0)
+                    line = (px, y0, px, y1)
+                else:
+                    _, py = self.uv_to_px(0, val)
+                    line = (x0, py, x1, py)
+                color = T["grid_axis"] if i == 0 else T["grid"] if is_major else T["grid_minor"]
+                c.create_line(*line, fill=color, width=1)
+                if is_major:
+                    label = format_tick(val, step)
+                    if vertical:
+                        c.create_text(px, y1 + 12, text=label, font=tick_font, fill=T["text_muted"])
+                    else:
+                        c.create_text(x0 - 6, py, text=label, font=tick_font, fill=T["text_muted"], anchor="e")
 
         # 2. Reference guide lines (key Slide 1 dimensions); skip labels that would overlap
         last_label_px = None
@@ -2529,8 +2689,12 @@ class LumericalGeometryApp:
         self.active_view = None
         self.geometry = None  # last reconstructed Geometry3D
         self.geometry_outdated = False  # views edited since the last reconstruction
+        self._undo_stack = []  # earlier states of the three views (see _view_state)
+        self._redo_stack = []
+        self._commit_pending = False
 
         self._build_ui()
+        self._history_state = self._view_state()
         self._build_menu()
         self._set_window_icon()
         self._update_title()
@@ -2653,9 +2817,14 @@ class LumericalGeometryApp:
             tooltip="Snap new and dragged points to guide lines and the grid\n(hold Shift to disable temporarily)",
         )
         self.snap_btn.pack(side=tk.LEFT, padx=(0, 6))
+        mod = "⌘" if sys.platform == "darwin" else "Ctrl+"
         FlatButton(
-            tools, "Mirror top (x-y)", self.mirror_xy_top_to_bottom, size=11, padx=10, pady=4,
-            tooltip="Mirror the upper (y > 0) outline of the top view across y = 0",
+            tools, "↶ Undo", self.undo, size=11, padx=10, pady=4,
+            tooltip=f"Undo the last change of the drawn points  ({mod}Z)",
+        ).pack(side=tk.LEFT, padx=(0, 4))
+        FlatButton(
+            tools, "↷ Redo", self.redo, size=11, padx=10, pady=4,
+            tooltip=f"Redo the change that was undone  ({mod}{'⇧Z' if sys.platform == 'darwin' else 'Y'})",
         ).pack(side=tk.LEFT)
 
         vsep(tools).pack(side=tk.LEFT, fill=tk.Y, padx=14, pady=2)
@@ -2753,10 +2922,10 @@ class LumericalGeometryApp:
             v_range=[-1.05, 1.05],
             u_guides=x_guides,
             v_guides=y_guides,
-            u_grid_step=100.0,
-            v_grid_step=0.25,
             on_point_selected=self._on_point_selected,
             on_geometry_changed=self._on_geometry_changed,
+            on_edit_finished=self._commit_history,
+            on_mirror=self.mirror_view,
         )
         self.view_xy.grid(row=0, column=0, sticky="nsew", padx=3, pady=3)
 
@@ -2770,10 +2939,10 @@ class LumericalGeometryApp:
             v_range=[-0.28, 0.28],
             u_guides=x_guides,
             v_guides=z_guides,
-            u_grid_step=100.0,
-            v_grid_step=0.1,
             on_point_selected=self._on_point_selected,
             on_geometry_changed=self._on_geometry_changed,
+            on_edit_finished=self._commit_history,
+            on_mirror=self.mirror_view,
         )
         self.view_xz.grid(row=1, column=0, sticky="nsew", padx=3, pady=3)
 
@@ -2791,10 +2960,10 @@ class LumericalGeometryApp:
             v_range=[-0.28, 0.28],
             u_guides=y_guides,
             v_guides=z_guides,
-            u_grid_step=0.25,
-            v_grid_step=0.1,
             on_point_selected=self._on_point_selected,
             on_geometry_changed=self._on_geometry_changed,
+            on_edit_finished=self._commit_history,
+            on_mirror=self.mirror_view,
         )
         self.view_yz.grid(row=1, column=1, sticky="nsew", padx=3, pady=3)
 
@@ -2858,8 +3027,21 @@ class LumericalGeometryApp:
         menubar.add_cascade(label="File", menu=file_menu)
 
         edit_menu = tk.Menu(menubar, tearoff=False)
-        edit_menu.add_command(label="Delete Selected Point", command=self.delete_selected_point)
-        edit_menu.add_command(label="Mirror Top View (x-y)", command=self.mirror_xy_top_to_bottom)
+        add(edit_menu, "Undo", "undo", self.undo, "z")
+        add(edit_menu, "Redo", "redo", self.redo, "z", shift=True)
+        if not mac:
+            self.root.bind("<Control-y>", lambda e: self._shortcut("redo", self.redo))
+        edit_menu.add_separator()
+        edit_menu.add_command(label="Delete Selected Point", accelerator="Delete", command=self.delete_selected_point)
+        mirror_menu = tk.Menu(edit_menu, tearoff=False)
+        for view in self._views().values():
+            name = view.title.split(" (")[0]
+            for axis, label in (("v", view.v_label), ("u", view.u_label)):
+                mirror_menu.add_command(
+                    label=f"{name}: symmetric about {label} = 0",
+                    command=lambda v=view, a=axis: self.mirror_view(v, a),
+                )
+        edit_menu.add_cascade(label="Mirror", menu=mirror_menu)
         edit_menu.add_separator()
         edit_menu.add_command(label="Load Slide 1 Preset", command=self.load_slide1_preset)
         edit_menu.add_command(label="Clear All Views", command=self.clear_all)
@@ -3029,6 +3211,7 @@ class LumericalGeometryApp:
             entry.delete(0, tk.END)
             entry.insert(0, value)
         self.reset_all_views()
+        self.reset_history()
         self.model_path = None
         self._set_dirty(False)
         self._update_title()
@@ -3062,6 +3245,7 @@ class LumericalGeometryApp:
             return False
 
         self.apply_model(data)
+        self.reset_history()
         self.model_path = os.path.abspath(path)
         self._set_dirty(False)
         self._update_title()
@@ -3461,9 +3645,67 @@ class LumericalGeometryApp:
         if self.active_view is not None:
             self.active_view.delete_selected_point()
 
+    # ==================================================================
+    # Undo / redo (snapshots of the points of the three 2D views)
+    # ==================================================================
+    HISTORY_LIMIT = 300
+
+    def _view_state(self):
+        return tuple(
+            (tuple(tuple(p) for p in view.points), bool(view.closed)) for view in self._views().values()
+        )
+
+    def _schedule_commit(self):
+        """Records the change once the current action is complete (several views may change in one action)."""
+        if not self._commit_pending:
+            self._commit_pending = True
+            self.root.after_idle(self._commit_history)
+
+    def _commit_history(self):
+        """Pushes the previous state onto the undo stack if the views changed since the last commit."""
+        self._commit_pending = False
+        if any(view.dragging_idx is not None for view in self._views().values()):
+            return  # committed when the mouse button is released
+        state = self._view_state()
+        if state != self._history_state:
+            self._undo_stack.append(self._history_state)
+            del self._undo_stack[: -self.HISTORY_LIMIT]
+            self._redo_stack.clear()
+            self._history_state = state
+
+    def reset_history(self):
+        self._undo_stack.clear()
+        self._redo_stack.clear()
+        self._history_state = self._view_state()
+
+    def _restore_state(self, state):
+        self._history_state = state
+        for view, (points, closed) in zip(self._views().values(), state):
+            if (tuple(tuple(p) for p in view.points), bool(view.closed)) != (points, closed):
+                view.set_points([list(p) for p in points], closed=closed)
+
+    def undo(self):
+        self._commit_history()  # include a change that is still waiting to be recorded
+        if not self._undo_stack:
+            self.set_status("Nothing to undo.")
+            return
+        self._redo_stack.append(self._history_state)
+        self._restore_state(self._undo_stack.pop())
+        self.set_status(f"Undone. ({len(self._undo_stack)} more step(s) to undo)")
+
+    def redo(self):
+        self._commit_history()
+        if not self._redo_stack:
+            self.set_status("Nothing to redo.")
+            return
+        self._undo_stack.append(self._history_state)
+        self._restore_state(self._redo_stack.pop())
+        self.set_status(f"Redone. ({len(self._redo_stack)} more step(s) to redo)")
+
     def _on_geometry_changed(self):
         """Called by the 2D views whenever points are added, moved, deleted or replaced."""
         self._set_dirty(True)
+        self._schedule_commit()
         if self.geometry is not None and not self.geometry_outdated:
             self.geometry_outdated = True
             self.view_3d.set_state("outdated")
@@ -3483,24 +3725,18 @@ class LumericalGeometryApp:
         self.view_3d.set_state("empty")
         self.set_status("Cleared all views. Draw connected points in (x-y), (x-z) and (y-z).")
 
-    def mirror_xy_top_to_bottom(self):
-        """Mirrors the upper profile points (y > 0) in Top view (x-y) across y = 0 to form a symmetric waveguide."""
-        pts = self.view_xy.points
-        if len(pts) < 2:
-            messagebox.showinfo(
-                "Mirror Top (x-y)",
-                "Draw at least 2 connected points along the upper boundary (y > 0) in Top view (x-y) first.",
-            )
+    def mirror_view(self, view, axis):
+        """Makes the outline of one 2D view symmetric about u = 0 or v = 0 (undoable)."""
+        label = view.u_label if axis == "u" else view.v_label
+        try:
+            sign = view.mirror(axis)
+        except GeometryError as exc:
+            self.set_status(f"Mirror {view.title}: {exc}", "warn")
+            messagebox.showinfo(f"Mirror {view.title}", str(exc), parent=self.root)
             return
-        # Keep upper half points (or all points if user only drew one side) sorted by x
-        upper = [p for p in pts if p[1] >= 0]
-        if len(upper) < 2:
-            upper = list(pts)
-        upper_sorted = sorted(upper, key=lambda p: p[0])
-        lower_sorted = [[p[0], -abs(p[1])] for p in upper_sorted]
-        upper_clean = [[p[0], abs(p[1])] for p in reversed(upper_sorted)]
-        self.view_xy.set_points(lower_sorted + upper_clean, closed=True)
-        self.set_status("Mirrored the Top view (x-y) profile symmetrically across y = 0.")
+        half = f"{label} {'>' if sign > 0 else '<'} 0"
+        self.set_status(f"Mirrored the {half} half of the {view.title} onto the other side of {label} = 0.")
+        self._commit_history()
 
     def load_slide1_preset(self):
         """Loads the exact Slide 1 geometry into the three orthographic 2D views."""

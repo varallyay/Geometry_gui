@@ -488,3 +488,126 @@ def test_gui_save_and_open_model(app, tmp_path):
     assert app.ent_cell.get() == "my_cell"
     assert app.geometry is not None and not app.dirty
     assert app.config["recent_files"][0] == str(path)
+
+
+# ----------------------------------------------------------------------
+# 2D view helpers: zoom-dependent ticks, mirroring
+# ----------------------------------------------------------------------
+@pytest.mark.parametrize(
+    "span,pixels,expected",
+    [(680, 600, 100), (68, 600, 10), (0.5, 600, 0.1), (2.1, 300, 1), (0.002, 600, 0.0005), (6800, 600, 1000)],
+)
+def test_nice_tick_step_follows_zoom(span, pixels, expected):
+    step = gg.nice_tick_step(span, pixels, 80)
+    assert step == pytest.approx(expected)
+    assert pixels * step / span >= 80 * (1 - 1e-9)  # never denser than the minimum spacing
+
+
+def test_minor_step_and_labels():
+    assert gg.minor_tick_step(100) == pytest.approx(20)
+    assert gg.minor_tick_step(0.2) == pytest.approx(0.05)
+    assert gg.minor_tick_step(0.5) == pytest.approx(0.1)
+    assert gg.format_tick(3 * 0.1, 0.1) == "0.3"
+    assert gg.format_tick(-1e-17, 0.05) == "0"
+    assert gg.format_tick(0.0015, 0.0005) == "0.0015"
+    assert gg.format_tick(300, 100) == "300"
+
+
+UPPER_EDGE = [[-300, 0.05], [-110, 0.25], [-100, 0.75], [100, 0.75], [110, 0.25], [300, 0.05]]
+
+
+@pytest.mark.parametrize("closed", [False, True])
+def test_mirror_upper_profile(closed):
+    pts, sign = gg.mirror_outline(UPPER_EDGE, closed=closed, axis="v")
+    assert sign == 1
+    assert sorted(map(tuple, pts)) == sorted(map(tuple, gg.SLIDE1_PRESET["xy"]))
+
+
+def test_mirror_keeps_shape_when_already_symmetric():
+    pts, _ = gg.mirror_outline(gg.SLIDE1_PRESET["xy"], closed=True, axis="v")
+    assert sorted(map(tuple, pts)) == sorted(map(tuple, gg.SLIDE1_PRESET["xy"]))
+    assert abs(gg.polygon_area(pts)) == pytest.approx(abs(gg.polygon_area(gg.SLIDE1_PRESET["xy"])))
+
+
+def test_mirror_front_view_left_right():
+    right_half = [[0, -0.04], [0.05, -0.02], [0.05, 0.02], [0, 0]]
+    pts, _ = gg.mirror_outline(right_half, closed=True, axis="u")
+    assert sorted(map(tuple, pts)) == sorted(
+        [(0, -0.04), (0.05, -0.02), (0.05, 0.02), (0, 0), (-0.05, 0.02), (-0.05, -0.02)]
+    )
+    gg.normalized_cross_section(pts)  # a valid, simple outline
+
+
+def test_mirror_side_view_keeps_the_larger_half():
+    # lower half (z < 0) has more points: it is mirrored upwards
+    xz = [[-300, 0.02], [-300, -0.02], [-100, -0.125], [100, -0.125], [300, -0.02], [300, 0.02]]
+    pts, sign = gg.mirror_outline(xz, closed=True, axis="v")
+    assert sign == -1
+    assert sorted(map(tuple, pts)) == sorted(
+        [(-300, -0.02), (-100, -0.125), (100, -0.125), (300, -0.02), (300, 0.02), (100, 0.125), (-100, 0.125), (-300, 0.02)]
+    )
+
+
+def test_mirror_rejects_points_on_the_axis():
+    with pytest.raises(gg.GeometryError):
+        gg.mirror_outline([[0, 0], [1, 0], [2, 0]], closed=True, axis="v")
+
+
+def test_gui_undo_redo(app):
+    view = app.view_xy
+    view.set_points([[0, 0], [10, 0], [10, 1]], closed=True)
+    app._commit_history()
+    view.set_points([[0, 0], [10, 0], [10, 1], [0, 1]], closed=True)  # e.g. an accidental extra point
+    app._commit_history()
+    app.undo()
+    assert view.points == [[0, 0], [10, 0], [10, 1]]
+    app.undo()
+    assert view.points == []
+    app.undo()  # nothing more: no error
+    app.redo()
+    app.redo()
+    assert view.points == [[0, 0], [10, 0], [10, 1], [0, 1]]
+    # a new edit clears the redo stack
+    app.undo()
+    view.set_points([[5, 5], [6, 5], [6, 6]], closed=True)
+    app._commit_history()
+    app.redo()
+    assert view.points == [[5, 5], [6, 5], [6, 6]]
+
+
+def test_gui_undo_clear_all_and_mirror(app):
+    app.load_slide1_preset()
+    app._commit_history()
+    app.clear_all()
+    app._commit_history()
+    app.undo()  # one step restores all three views
+    assert all(len(v.points) >= 3 for v in app._views().values())
+    app.view_yz.set_points([[0, -0.04], [0.05, -0.02], [0.05, 0.02], [0, 0]], closed=True)
+    app._commit_history()
+    app.mirror_view(app.view_yz, "u")
+    assert len(app.view_yz.points) == 6
+    app.undo()
+    assert len(app.view_yz.points) == 4
+
+
+def test_gui_open_model_resets_history(app, tmp_path):
+    app.load_slide1_preset()
+    path = tmp_path / "m.3dgg"
+    app.save_model_to(str(path))
+    app.open_model_path(str(path), confirm=False)
+    app.undo()
+    assert len(app.view_xy.points) == 12  # nothing before the opened model
+
+
+def test_gui_snap_follows_zoom(app):
+    view = app.view_xy
+    app.root.update()
+    view.u_range, view.v_range = [-340.0, 340.0], [-1.05, 1.05]
+    coarse = view.tick_steps()[0][1]
+    view.u_range, view.v_range = [-0.34, 0.34], [-0.00105, 0.00105]
+    fine = view.tick_steps()[0][1]
+    assert fine == pytest.approx(coarse / 1000)
+    view.u_guides = []  # test the grid snap only
+    u, _ = view.snap_uv(0.01234, 0.0)
+    assert abs(u - 0.01234) <= fine / 2 + 1e-12
+    assert u / fine == pytest.approx(round(u / fine))
