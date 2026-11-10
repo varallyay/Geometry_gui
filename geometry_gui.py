@@ -23,6 +23,13 @@ Features:
       * Undo / redo every change of the drawn points (Cmd/Ctrl+Z, Cmd+Shift+Z / Ctrl+Y).
       * Mirror any view about its horizontal or vertical axis (⇅ / ⇆ in the view header).
   - The grid, tick labels and snap step follow the zoom level.
+  - Several layers: "+ Add layer" (Cmd/Ctrl+L) next to the Layer selector adds a
+    layer with the next free GDS layer number; drawing continues on the selected
+    layer until another one is chosen (selector, Layer menu, Cmd/Ctrl+1…9). Each
+    layer has its own three views and colour; the other layers are shown as dashed
+    outlines in the 2D views and all layers in colour in the 3D view. Exports
+    contain every drawn layer (.lsf: one structure group per layer, .gds / .py:
+    each outline on its own GDS layer).
   - "Generate geometry" button: Reconstructs the 3D solid from the three
     orthographic views and displays it in the 3D view.
   - "Generate file" button: Exports the drawn and reconstructed 3D geometry as
@@ -47,7 +54,7 @@ Usage:
     python geometry_gui.py --install | --uninstall | --check-updates | --version
 """
 
-__version__ = "0.3.2"
+__version__ = "0.4.0"
 APP_NAME = "3D Geometry Generation"
 APP_SHORT_NAME = "3D Geometry Gen"  # macOS menu bar (CFBundleName, max. ~15 characters)
 
@@ -70,7 +77,7 @@ from dataclasses import dataclass
 os.environ.setdefault("TK_SILENCE_DEPRECATION", "1")
 
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 
 
 # ======================================================================
@@ -82,6 +89,7 @@ GDS_DBU_UM = 1e-3  # GDS database unit: 1 nm
 DEFAULT_GDS_LAYER = (1, 0)
 DEFAULT_CELL_NAME = "InP_waveguide"
 DEFAULT_MATERIAL = "InP"
+VIEW_KEYS = ("xy", "xz", "yz")  # Top, Side, Front view
 
 SLIDE1_PRESET = {
     # Top view (x-y): 12-vertex symmetric two-stage tapered InP waveguide
@@ -495,23 +503,67 @@ def reconstruct_geometry(xy_pts, xz_pts, yz_pts):
     )
 
 
+def format_layer(layer):
+    return f"{layer[0]}/{layer[1]}"
+
+
+def next_free_layer(layers):
+    """Next unused GDS layer number (datatype 0) after the highest one in use."""
+    return (max((lay[0] for lay in layers), default=0) + 1, 0)
+
+
+def reconstruct_layers(layers):
+    """
+    Reconstructs several layers. layers: [(gds_layer, {"xy": pts, "xz": pts, "yz": pts}), ...].
+    Layers without any drawn point are skipped; a partly drawn layer is an error.
+    Returns [(gds_layer, Geometry3D), ...].
+    """
+    result, first_error = [], None
+    for layer, views in layers:
+        if not any(views.get(key) for key in VIEW_KEYS):
+            continue
+        try:
+            result.append((tuple(layer), reconstruct_geometry(views["xy"], views["xz"], views["yz"])))
+        except GeometryError as exc:
+            raise GeometryError(f"Layer {format_layer(layer)}: {exc}" if len(layers) > 1 else str(exc)) from None
+    if not result:
+        # nothing drawn at all: report it like for a single empty layer
+        try:
+            reconstruct_geometry([], [], [])
+        except GeometryError as exc:
+            first_error = exc
+        raise first_error
+    return result
+
+
 # ----------------------------------------------------------------------
 # Ansys Lumerical (.lsf)
 # ----------------------------------------------------------------------
-_LSF_GROUP_HEADER = [
-    "# -------------------------------------------------------------------------",
-    "# 2. Build 3D Geometry inside 'InP_Structure' Group",
-    "# -------------------------------------------------------------------------",
-    "addstructuregroup;",
-    'set("name", "InP_Structure");',
-    'set("x", 0);',
-    'set("y", 0);',
-    'set("z", 0);',
-    "",
-]
+def as_layer_list(geom, layer=DEFAULT_GDS_LAYER):
+    """Accepts one Geometry3D or a list of (gds_layer, Geometry3D); returns the list form."""
+    if isinstance(geom, Geometry3D):
+        return [(tuple(layer), geom)]
+    layers = [(tuple(lay), g) for lay, g in geom]
+    if not layers:
+        raise GeometryError("There is no drawn layer to export.")
+    return layers
 
 
-def _lsf_planar_solids(geom):
+def _lsf_group_header(group, title):
+    return [
+        "# -------------------------------------------------------------------------",
+        f"# {title}",
+        "# -------------------------------------------------------------------------",
+        "addstructuregroup;",
+        f'set("name", "{group}");',
+        'set("x", 0);',
+        'set("y", 0);',
+        'set("z", 0);',
+        "",
+    ]
+
+
+def _lsf_planar_solids(geom, group, tag):
     """
     Script lines for a non-rectangular Front-view cross-section: one Lumerical
     planar solid (closed triangle/polygon mesh) per longitudinal section.
@@ -525,8 +577,7 @@ def _lsf_planar_solids(geom):
         "# bounding box and stretched to the local width (Top view) and thickness (Side view):",
         "#   " + "  ".join(f"({f(s_)}, {f(t_)})" for s_, t_ in sec),
         "",
-    ] + _LSF_GROUP_HEADER
-
+    ]
     facets = [list(range(n, 0, -1)), list(range(n + 1, 2 * n + 1))]  # start cap (-x), end cap (+x)
     for i in range(n):
         j = (i + 1) % n
@@ -538,101 +589,39 @@ def _lsf_planar_solids(geom):
         end = section_points_3d(sec, seg["x1"], seg["y1_bot"], seg["y1_top"], seg["z1_bot"], seg["z1_top"])
         verts = start + end
         len_tag = f"{round(seg['x1'] - seg['x0'], 3):g}".replace(".", "p")
+        v_name, f_name = f"V{tag}_sec_{idx}", f"F{tag}_sec_{idx}"
         lines.append(
             f"# Section ({idx}): x=[{f(seg['x0'])}, {f(seg['x1'])}] um, "
             f"width {f(seg['y0_top'] - seg['y0_bot'])} -> {f(seg['y1_top'] - seg['y1_bot'])} um, "
             f"thickness {f(seg['z0_top'] - seg['z0_bot'])} -> {f(seg['z1_top'] - seg['z1_bot'])} um"
         )
-        lines.append(f"V_sec_{idx} = [")
+        lines.append(f"{v_name} = [")
         for k, (vx, vy, vz) in enumerate(verts):
             sep = ";" if k < len(verts) - 1 else ""
             lines.append(f"    {f(vx)}, {f(vy)}, {f(vz)}{sep}")
         lines.append("] * um;")
-        lines.append(f"F_sec_{idx} = cell({len(facets)});")
+        lines.append(f"{f_name} = cell({len(facets)});")
         for k, fac in enumerate(facets, start=1):
-            lines.append(f"F_sec_{idx}{{{k}}} = cell(1);  F_sec_{idx}{{{k}}}{{1}} = [{', '.join(map(str, fac))}];")
+            lines.append(f"{f_name}{{{k}}} = cell(1);  {f_name}{{{k}}}{{1}} = [{', '.join(map(str, fac))}];")
         lines.extend(
             [
-                f"addplanarsolid(V_sec_{idx}, F_sec_{idx});",
+                f"addplanarsolid({v_name}, {f_name});",
                 f'set("name", "section_{idx}_{len_tag}um");',
                 'set("material", mat_name);',
-                'addtogroup("InP_Structure");',
+                f'addtogroup("{group}");',
                 "",
             ]
         )
-
-    x_total = geom.segments[-1]["x1"] - geom.segments[0]["x0"]
-    z_min, z_max = geom.z_span
-    lines.extend(
-        [
-            f'?"3D InP structure successfully generated ({len(geom.segments)} planar solids, '
-            f'total x-length: {f(x_total)} um, max y-width: {f(geom.bbox[3] - geom.bbox[2])} um, '
-            f'z-thickness: {f((z_max - z_min) * 1000.0)} nm).";',
-            "",
-        ]
-    )
     return lines
 
 
-def build_lsf(geom):
-    """Builds the Ansys Lumerical .lsf script string from a reconstructed geometry."""
+def _lsf_box_sections(geom, group, tag):
+    """Script lines for a rectangular cross-section: addrect / addpoly per section (or one polygon)."""
     f = fmt_num
-    z_min, z_max = geom.z_span
-    t_z_nm = (z_max - z_min) * 1000.0
-    z_center_um = 0.5 * (z_min + z_max)
-
     lines = [
-        "# =========================================================================",
-        "# Ansys Lumerical Script (.lsf)",
-        "# 3D Geometry Generated from Interactive Multi-View Geometry Builder",
-        "#",
-        "# Coordinate System:",
-        "#   x : Propagation / longitudinal direction",
-        "#   y : Lateral / width direction (in-plane)",
-        "#   z : Vertical / thickness direction (out-of-plane)",
-        "# =========================================================================",
-        "",
-        "clear;",
-        "deleteall;",
-        "",
-        "# -------------------------------------------------------------------------",
-        "# 1. Units & Global Parameters (SI units: meters)",
-        "# -------------------------------------------------------------------------",
-        "um = 1e-6;",
-        "nm = 1e-9;",
-        "",
-        f"t_z      = {f(t_z_nm)} * nm;   # Layer thickness ({f(z_max - z_min)} um)",
-        f"z_center = {f(z_center_um)} * um;   # Center z-coordinate",
-        "",
-        "# Material configuration",
-        'mat_name = "InP - Palik";',
-        "if (!materialexists(mat_name)) {",
-        '    if (materialexists("InP")) {',
-        '        mat_name = "InP";',
-        "    } else {",
-        '        mat_name = addmaterial("(n,k) Material");',
-        '        setmaterial(mat_name, "name", "InP");',
-        '        setmaterial("InP", "Refractive Index", 3.17);',
-        '        mat_name = "InP";',
-        "    }",
-        "}",
-        "",
+        "if (use_single_polygon == 1) {",
+        f"    V{tag}_all = [",
     ]
-    if not geom.section_is_rect:
-        lines.extend(_lsf_planar_solids(geom))
-        return "\n".join(lines)
-    lines.extend(
-        [
-            "# Toggle: 0 = Individual longitudinal sections, 1 = Unified extruded polygon",
-            "use_single_polygon = 0;",
-            "",
-        ]
-        + _LSF_GROUP_HEADER
-        + [
-            "if (use_single_polygon == 1) {",
-            "    V_all = [",
-        ]
-    )
     n_poly = len(geom.xy_poly)
     for idx, (vx, vy) in enumerate(geom.xy_poly):
         sep = ";" if idx < n_poly - 1 else ""
@@ -641,14 +630,14 @@ def build_lsf(geom):
         [
             "    ];",
             "    addpoly;",
-            '    set("name", "InP_waveguide_full");',
+            f'    set("name", "InP_waveguide{tag}_full");',
             '    set("x", 0);',
             '    set("y", 0);',
-            '    set("z", z_center);',
-            '    set("z span", t_z);',
-            '    set("vertices", V_all);',
+            f'    set("z", z_center{tag});',
+            f'    set("z span", t_z{tag});',
+            f'    set("vertices", V{tag}_all);',
             '    set("material", mat_name);',
-            '    addtogroup("InP_Structure");',
+            f'    addtogroup("{group}");',
             "} else {",
         ]
     )
@@ -679,7 +668,7 @@ def build_lsf(geom):
                     f'    set("z", {f(seg_z_c)} * um);',
                     f'    set("z span", {f(seg_z_span_nm)} * nm);',
                     '    set("material", mat_name);',
-                    '    addtogroup("InP_Structure");',
+                    f'    addtogroup("{group}");',
                     "",
                 ]
             )
@@ -687,7 +676,7 @@ def build_lsf(geom):
             lines.extend(
                 [
                     f"    # Section ({idx}): Taper x=[{f(x0)}, {f(x1)}] um, width={f(w0)} um -> {f(w1)} um",
-                    f"    V_sec_{idx} = [",
+                    f"    V{tag}_sec_{idx} = [",
                     f"        {f(x0)} * um, {f(y0_b)} * um;",
                     f"        {f(x1)} * um, {f(y1_b)} * um;",
                     f"        {f(x1)} * um, {f(y1_t)} * um;",
@@ -699,26 +688,114 @@ def build_lsf(geom):
                     '    set("y", 0);',
                     f'    set("z", {f(seg_z_c)} * um);',
                     f'    set("z span", {f(seg_z_span_nm)} * nm);',
-                    f'    set("vertices", V_sec_{idx});',
+                    f'    set("vertices", V{tag}_sec_{idx});',
                     '    set("material", mat_name);',
-                    '    addtogroup("InP_Structure");',
+                    f'    addtogroup("{group}");',
                     "",
                 ]
             )
+    lines.extend(["}", ""])
+    return lines
 
-    x_total = geom.segments[-1]["x1"] - geom.segments[0]["x0"]
-    w_max = max(
-        max(s["y0_top"] - s["y0_bot"], s["y1_top"] - s["y1_bot"]) for s in geom.segments
-    )
+
+def build_lsf(geom):
+    """
+    Builds the Ansys Lumerical .lsf script string.
+    geom: one Geometry3D, or a list of (gds_layer, Geometry3D) for several layers;
+    every layer becomes its own structure group (Layer_<layer>_<datatype>).
+    """
+    f = fmt_num
+    layers = as_layer_list(geom)
+    multi = len(layers) > 1
+    tags = [f"_L{lay[0]}_{lay[1]}" if multi else "" for lay, _ in layers]
+
+    lines = [
+        "# =========================================================================",
+        "# Ansys Lumerical Script (.lsf)",
+        f"# 3D Geometry generated by {APP_NAME} {__version__}"
+        + (f" ({len(layers)} layers)" if multi else ""),
+        "#",
+        "# Coordinate System:",
+        "#   x : Propagation / longitudinal direction",
+        "#   y : Lateral / width direction (in-plane)",
+        "#   z : Vertical / thickness direction (out-of-plane)",
+        "# =========================================================================",
+        "",
+        "clear;",
+        "deleteall;",
+        "",
+        "# -------------------------------------------------------------------------",
+        "# 1. Units & Global Parameters (SI units: meters)",
+        "# -------------------------------------------------------------------------",
+        "um = 1e-6;",
+        "nm = 1e-9;",
+        "",
+    ]
+    for (lay, g), tag in zip(layers, tags):
+        z_min, z_max = g.z_span
+        if multi:
+            lines.append(f"# Layer {lay[0]}/{lay[1]}")
+        lines.append(f"{'t_z' + tag:<9}= {f((z_max - z_min) * 1000.0)} * nm;   # Layer thickness ({f(z_max - z_min)} um)")
+        lines.append(f"{'z_center' + tag:<9}= {f(0.5 * (z_min + z_max))} * um;   # Center z-coordinate")
     lines.extend(
         [
-            "}",
             "",
-            f'?"3D InP structure successfully generated (Total x-length: {f(x_total)} um, '
-            f'max y-width: {f(w_max)} um, z-thickness: {f(t_z_nm)} nm).";',
+            "# Material configuration",
+            'mat_name = "InP - Palik";',
+            "if (!materialexists(mat_name)) {",
+            '    if (materialexists("InP")) {',
+            '        mat_name = "InP";',
+            "    } else {",
+            '        mat_name = addmaterial("(n,k) Material");',
+            '        setmaterial(mat_name, "name", "InP");',
+            '        setmaterial("InP", "Refractive Index", 3.17);',
+            '        mat_name = "InP";',
+            "    }",
+            "}",
             "",
         ]
     )
+    if any(g.section_is_rect for _, g in layers):
+        lines.extend(
+            [
+                "# Toggle: 0 = Individual longitudinal sections, 1 = Unified extruded polygon",
+                "use_single_polygon = 0;",
+                "",
+            ]
+        )
+
+    for num, ((lay, g), tag) in enumerate(zip(layers, tags), start=2):
+        group = f"Layer_{lay[0]}_{lay[1]}" if multi else "InP_Structure"
+        title = (
+            f"{num}. Layer {lay[0]}/{lay[1]} inside '{group}' Group"
+            if multi
+            else f"2. Build 3D Geometry inside '{group}' Group"
+        )
+        lines.extend(_lsf_group_header(group, title))
+        if g.section_is_rect:
+            lines.extend(_lsf_box_sections(g, group, tag))
+        else:
+            lines.extend(_lsf_planar_solids(g, group, tag))
+
+    if multi:
+        z_lo = min(g.z_span[0] for _, g in layers)
+        z_hi = max(g.z_span[1] for _, g in layers)
+        lines.append(
+            f'?"3D InP structure successfully generated ({len(layers)} layers: '
+            + ", ".join(f"{lay[0]}/{lay[1]}" for lay, _ in layers)
+            + f"; z from {f(z_lo)} to {f(z_hi)} um).\";"
+        )
+    else:
+        g = layers[0][1]
+        z_min, z_max = g.z_span
+        x_total = g.segments[-1]["x1"] - g.segments[0]["x0"]
+        w_max = max(max(s["y0_top"] - s["y0_bot"], s["y1_top"] - s["y1_bot"]) for s in g.segments)
+        kind = "" if g.section_is_rect else f"{len(g.segments)} planar solids, "
+        lines.append(
+            f'?"3D InP structure successfully generated ({kind}Total x-length: {f(x_total)} um, '
+            f'max y-width: {f(w_max)} um, z-thickness: {f((z_max - z_min) * 1000.0)} nm).";'
+        )
+    lines.append("")
     return "\n".join(lines)
 
 
@@ -798,7 +875,8 @@ def _gds_string(text):
     return data + (b"\x00" if len(data) % 2 else b"")
 
 
-def _write_gds_builtin(path, cell_name, layer, polygons_dbu):
+def _write_gds_builtin(path, cell_name, polygons_dbu):
+    """polygons_dbu: [((layer, datatype), [(x, y), ...]), ...] on the 1 nm grid."""
     now = datetime.datetime.now()
     stamp = struct.pack(">6h", now.year, now.month, now.day, now.hour, now.minute, now.second) * 2
     out = [
@@ -809,7 +887,7 @@ def _write_gds_builtin(path, cell_name, layer, polygons_dbu):
         _gds_record(0x05, 0x02, stamp),  # BGNSTR
         _gds_record(0x06, 0x06, _gds_string(cell_name)),  # STRNAME
     ]
-    for pts in polygons_dbu:
+    for layer, pts in polygons_dbu:
         closed = list(pts) + [pts[0]]
         out += [
             _gds_record(0x08, 0x00),  # BOUNDARY
@@ -823,34 +901,36 @@ def _write_gds_builtin(path, cell_name, layer, polygons_dbu):
         fh.write(b"".join(out))
 
 
-def _write_gds_klayout(path, cell_name, layer, polygons_dbu):
+def _write_gds_klayout(path, cell_name, polygons_dbu):
     import klayout.db as kdb
 
     layout = kdb.Layout()  # fresh layout each time: no global cell-name clashes
     layout.dbu = GDS_DBU_UM
     cell = layout.create_cell(cell_name)
-    layer_idx = layout.layer(layer[0], layer[1])
-    for pts in polygons_dbu:
+    for layer, pts in polygons_dbu:
+        layer_idx = layout.layer(layer[0], layer[1])
         cell.shapes(layer_idx).insert(kdb.Polygon([kdb.Point(x, y) for x, y in pts]))
     layout.write(str(path))
 
 
 def write_gds(geom, path, cell_name=DEFAULT_CELL_NAME, layer=DEFAULT_GDS_LAYER, backend="auto"):
     """
-    Writes the top-view (x-y) outline as one polygon to a GDSII file (1 nm grid).
+    Writes the top-view (x-y) outline of every layer as one polygon on its GDS
+    layer to a GDSII file (1 nm grid). geom: one Geometry3D (written on `layer`)
+    or a list of (gds_layer, Geometry3D).
     backend: 'auto' (klayout.db if installed, else built-in), 'klayout' or 'builtin'.
     Returns the name of the backend used.
     """
     cell_name = sanitize_cell_name(cell_name)
-    polygons = [polygon_to_dbu(geom.xy_poly)]
+    polygons = [(lay, polygon_to_dbu(g.xy_poly)) for lay, g in as_layer_list(geom, layer)]
     if backend in ("auto", "klayout"):
         try:
-            _write_gds_klayout(path, cell_name, layer, polygons)
+            _write_gds_klayout(path, cell_name, polygons)
             return "klayout"
         except ImportError:
             if backend == "klayout":
                 raise
-    _write_gds_builtin(path, cell_name, layer, polygons)
+    _write_gds_builtin(path, cell_name, polygons)
     return "builtin"
 
 
@@ -858,97 +938,118 @@ def write_gds(geom, path, cell_name=DEFAULT_CELL_NAME, layer=DEFAULT_GDS_LAYER, 
 # gdsfactory / gdsfactory+ Python script (.py)
 # ----------------------------------------------------------------------
 def build_gdsfactory_script(geom, cell_name=DEFAULT_CELL_NAME, layer=DEFAULT_GDS_LAYER, material=DEFAULT_MATERIAL):
-    """Builds a standalone gdsfactory script; running it writes <script name>.gds."""
+    """
+    Builds a standalone gdsfactory script; running it writes <script name>.gds.
+    geom: one Geometry3D (placed on `layer`) or a list of (gds_layer, Geometry3D).
+    """
     f = fmt_num
     func = sanitize_cell_name(cell_name)
-    z_min, z_max = geom.z_span
+    layers = as_layer_list(geom, layer)
+    multi = len(layers) > 1
 
-    poly_lines = "\n".join(f"    ({f(x)}, {f(y)})," for x, y in geom.xy_poly)
-    sec_lines = "\n".join(
-        f"    [({f(s['x0'])}, {f(s['y0_bot'])}), ({f(s['x1'])}, {f(s['y1_bot'])}), "
-        f"({f(s['x1'])}, {f(s['y1_top'])}), ({f(s['x0'])}, {f(s['y0_top'])})],"
-        for s in geom.segments
-    )
-    z_note = (
-        ""
-        if geom.z_is_uniform
-        else (
-            "# NOTE: the drawn side view has an x-dependent thickness. GDS is a 2D format,\n"
-            "#       so only the overall z-range is stored in the LayerStack below.\n"
+    notes = []
+    if any(not g.z_is_uniform for _, g in layers):
+        notes.append(
+            "# NOTE: a drawn side view has an x-dependent thickness. GDS is a 2D format,\n"
+            "#       so only the overall z-range of each layer is stored in the LayerStack below.\n"
         )
-    )
-    if not geom.section_is_rect:
-        z_note += (
-            "# NOTE: the Front view (y-z) defines a non-rectangular cross-section. GDS and the\n"
+    if any(not g.section_is_rect for _, g in layers):
+        notes.append(
+            "# NOTE: a Front view (y-z) defines a non-rectangular cross-section. GDS and the\n"
             "#       LayerStack only describe the top-view outline and the thickness; the exact\n"
             "#       3D shape is exported in the Lumerical script (.lsf, planar solids).\n"
         )
 
+    entries = []
+    for lay, g in layers:
+        z_min, z_max = g.z_span
+        name = f"layer_{lay[0]}_{lay[1]}" if multi else "core"
+        poly = "\n".join(f"            ({f(x)}, {f(y)})," for x, y in g.xy_poly)
+        secs = "\n".join(
+            f"            [({f(sg['x0'])}, {f(sg['y0_bot'])}), ({f(sg['x1'])}, {f(sg['y1_bot'])}), "
+            f"({f(sg['x1'])}, {f(sg['y1_top'])}), ({f(sg['x0'])}, {f(sg['y0_top'])})],"
+            for sg in g.segments
+        )
+        entries.append(
+            f"""    {{
+        "name": "{name}",
+        "layer": ({lay[0]}, {lay[1]}),
+        "zmin_um": {f(z_min)},
+        "thickness_um": {f(z_max - z_min)},
+        # Top-view outline (x, y) in um
+        "polygon_xy_um": [
+{poly}
+        ],
+        # Same outline split into the longitudinal sections used for the Lumerical export
+        "sections_xy_um": [
+{secs}
+        ],
+    }},"""
+        )
+    layer_list = ", ".join(f"{lay[0]}/{lay[1]}" for lay, _ in layers)
+
     return f'''#!/usr/bin/env python3
 """
-gdsfactory layout script generated by geometry_gui.py ({datetime.date.today().isoformat()}).
+gdsfactory layout script generated by {APP_NAME} {__version__} ({datetime.date.today().isoformat()}).
 
 Run it to write the GDS file next to this script (same name, .gds extension):
     python <this_script>.py
     python <this_script>.py --show    # also opens the layout (KLayout klive / gdsfactory+)
 
-The top-view (x-y) outline is placed on GDS layer {layer[0]}/{layer[1]}; units are micrometers.
-In gdsfactory+ / your own PDK, import `{func}` and use it like any other @gf.cell.
+The top-view (x-y) outline of each drawn layer is placed on its GDS layer ({layer_list});
+units are micrometers. In gdsfactory+ / your own PDK, import `{func}` and use it like any
+other @gf.cell.
 """
 
 import gdsfactory as gf
 
-LAYER = ({layer[0]}, {layer[1]})
 MATERIAL = "{material}"
-ZMIN_UM = {f(z_min)}
-THICKNESS_UM = {f(z_max - z_min)}
-{z_note}
-# Top-view outline (x, y) in um
-POLYGON_XY_UM = [
-{poly_lines}
-]
-
-# Same outline split into the longitudinal sections used for the Lumerical export
-SECTIONS_XY_UM = [
-{sec_lines}
+{"".join(notes)}
+# One entry per drawn layer: GDS layer, z position and thickness, outline and sections
+LAYERS = [
+{chr(10).join(entries)}
 ]
 
 
-def _build(polygons) -> gf.Component:
+def _build(key) -> gf.Component:
     c = gf.Component()
-    for poly in polygons:
-        c.add_polygon(poly, layer=LAYER)
+    for lay in LAYERS:
+        polygons = [lay["polygon_xy_um"]] if key == "polygon" else lay["sections_xy_um"]
+        for poly in polygons:
+            c.add_polygon(poly, layer=lay["layer"])
     c.info["material"] = MATERIAL
-    c.info["zmin_um"] = ZMIN_UM
-    c.info["thickness_um"] = THICKNESS_UM
+    c.info["layers"] = ", ".join(f"{{a}}/{{b}}" for a, b in (lay["layer"] for lay in LAYERS))
+    c.info["zmin_um"] = min(lay["zmin_um"] for lay in LAYERS)
+    c.info["thickness_um"] = max(lay["zmin_um"] + lay["thickness_um"] for lay in LAYERS) - c.info["zmin_um"]
     return c
 
 
 # The cells take no arguments so that the GDS cell name is exactly the function name.
 @gf.cell
 def {func}() -> gf.Component:
-    """Structure drawn in geometry_gui.py as a single polygon."""
-    return _build([POLYGON_XY_UM])
+    """Structure drawn in {APP_NAME}: one polygon per layer."""
+    return _build("polygon")
 
 
 @gf.cell
 def {func}_sections() -> gf.Component:
     """Same structure as one polygon per longitudinal section."""
-    return _build(SECTIONS_XY_UM)
+    return _build("sections")
 
 
 def get_layer_stack():
-    """LayerStack with the drawn thickness and z position (for 3D views / simulation plugins)."""
+    """LayerStack with the drawn thickness and z position of every layer (3D views / simulation plugins)."""
     from gdsfactory.technology import LayerLevel, LayerStack
 
     return LayerStack(
         layers={{
-            "core": LayerLevel(
-                layer=LAYER,
-                thickness=THICKNESS_UM,
-                zmin=ZMIN_UM,
+            lay["name"]: LayerLevel(
+                layer=lay["layer"],
+                thickness=lay["thickness_um"],
+                zmin=lay["zmin_um"],
                 material=MATERIAL,
             )
+            for lay in LAYERS
         }}
     )
 
@@ -978,7 +1079,10 @@ _RESERVED_SCRIPT_NAMES = {"gdsfactory", "klayout", "kfactory", "gplugins", "nump
 
 
 def export_geometry(geom, path, cell_name=DEFAULT_CELL_NAME, layer=DEFAULT_GDS_LAYER):
-    """Writes geom to path; the format is chosen from the extension. Returns a short description."""
+    """
+    Writes geom (one Geometry3D on `layer`, or a list of (gds_layer, Geometry3D))
+    to path; the format is chosen from the extension. Returns a short description.
+    """
     ext = os.path.splitext(path)[1].lower()
     if ext == ".lsf":
         with open(path, "w", encoding="utf-8") as fh:
@@ -986,7 +1090,8 @@ def export_geometry(geom, path, cell_name=DEFAULT_CELL_NAME, layer=DEFAULT_GDS_L
         return "Lumerical script"
     if ext == ".gds":
         backend = write_gds(geom, path, cell_name=cell_name, layer=layer)
-        return f"GDSII layout (cell {sanitize_cell_name(cell_name)}, layer {layer[0]}/{layer[1]}, via {backend})"
+        specs = ", ".join(f"{a}/{b}" for (a, b), _ in as_layer_list(geom, layer))
+        return f"GDSII layout (cell {sanitize_cell_name(cell_name)}, layer {specs}, via {backend})"
     if ext == ".py":
         stem = os.path.splitext(os.path.basename(path))[0]
         if stem in _RESERVED_SCRIPT_NAMES:
@@ -1004,16 +1109,20 @@ def export_geometry(geom, path, cell_name=DEFAULT_CELL_NAME, layer=DEFAULT_GDS_L
 # ======================================================================
 MODEL_EXT = ".3dgg"
 MODEL_FORMAT = "3dgg"
-MODEL_FORMAT_VERSION = 1
-VIEW_KEYS = ("xy", "xz", "yz")
+MODEL_FORMAT_VERSION = 2  # 2: several layers (0.4.0); 1: one set of views (0.3.x)
 
 
-def model_to_dict(views, export=None, snap=True):
+def model_to_dict(layers, export=None, snap=True, active_layer=0):
     """
     Builds the .3dgg document.
 
-    views: {"xy": (points, closed), "xz": ..., "yz": ...} with points as [[u, v], ...] in micrometers.
+    layers: [{"gds_layer": "1/0", "views": {"xy": (points, closed), "xz": ..., "yz": ...}}, ...]
+            with points as [[u, v], ...] in micrometers. A single views dict
+            {"xy": (points, closed), ...} is accepted as one layer (export["gds_layer"] or 1/0).
     """
+    if isinstance(layers, dict):
+        spec = (export or {}).get("gds_layer") or format_layer(DEFAULT_GDS_LAYER)
+        layers = [{"gds_layer": spec, "views": layers}]
     return {
         "format": MODEL_FORMAT,
         "format_version": MODEL_FORMAT_VERSION,
@@ -1021,11 +1130,21 @@ def model_to_dict(views, export=None, snap=True):
         "saved": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
         "units": "um",
         "material": DEFAULT_MATERIAL,
-        "views": {
-            key: {"points": [[float(u), float(v)] for u, v in views[key][0]], "closed": bool(views[key][1])}
-            for key in VIEW_KEYS
-        },
-        "export": dict(export or {}),
+        "active_layer": int(active_layer),
+        "layers": [
+            {
+                "gds_layer": format_layer(parse_layer_spec(layer["gds_layer"])),
+                "views": {
+                    key: {
+                        "points": [[float(u), float(v)] for u, v in layer["views"][key][0]],
+                        "closed": bool(layer["views"][key][1]),
+                    }
+                    for key in VIEW_KEYS
+                },
+            }
+            for layer in layers
+        ],
+        "export": {k: v for k, v in dict(export or {}).items() if k != "gds_layer"},
         "editor": {"snap": bool(snap)},
     }
 
@@ -1061,31 +1180,57 @@ def read_model(path):
             "Please update the application."
         )
 
-    views = data.get("views")
+    export = data.get("export") if isinstance(data.get("export"), dict) else {}
+    if file_version < 2:  # 0.3.x: one set of views, GDS layer in the export settings
+        raw_layers = [{"gds_layer": export.get("gds_layer") or format_layer(DEFAULT_GDS_LAYER), "views": data.get("views")}]
+    else:
+        raw_layers = data.get("layers")
+        if not isinstance(raw_layers, list) or not raw_layers:
+            raise GeometryError("The model file has no 'layers' section.")
+    layers, seen = [], set()
+    for raw in raw_layers:
+        if not isinstance(raw, dict):
+            raise GeometryError("A layer in the model file is malformed.")
+        try:
+            spec = parse_layer_spec(raw.get("gds_layer", ""))
+        except GeometryError as exc:
+            raise GeometryError(f"The model file contains an invalid layer: {exc}") from None
+        if spec in seen:
+            raise GeometryError(f"Layer {format_layer(spec)} appears twice in the model file.")
+        seen.add(spec)
+        layers.append({"gds_layer": format_layer(spec), "views": _read_views(raw.get("views"), spec)})
+    active = data.get("active_layer", 0)
+    active = active if isinstance(active, int) and 0 <= active < len(layers) else 0
+    export = {k: v for k, v in export.items() if k != "gds_layer"}
+    editor = data.get("editor") if isinstance(data.get("editor"), dict) else {}
+    out = {k: v for k, v in data.items() if k != "views"}
+    return {**out, "layers": layers, "active_layer": active, "export": export, "editor": editor}
+
+
+def _read_views(views, spec):
+    """Validates the views of one layer: {key: {"points": [[u, v], ...], "closed": bool}}."""
+    where = f"Layer {format_layer(spec)}"
     if not isinstance(views, dict):
-        raise GeometryError("The model file has no 'views' section.")
+        raise GeometryError(f"{where} in the model file has no 'views' section.")
     clean = {}
     for key in VIEW_KEYS:
         view = views.get(key, {"points": [], "closed": False})
         pts = view.get("points", []) if isinstance(view, dict) else None
         if not isinstance(pts, list):
-            raise GeometryError(f"View '{key}' in the model file is malformed.")
+            raise GeometryError(f"{where}: view '{key}' in the model file is malformed.")
         out = []
         for p in pts:
             if not (isinstance(p, (list, tuple)) and len(p) == 2):
-                raise GeometryError(f"View '{key}' contains an invalid point: {p!r}")
+                raise GeometryError(f"{where}: view '{key}' contains an invalid point: {p!r}")
             try:
                 u, v = float(p[0]), float(p[1])
             except (TypeError, ValueError):
-                raise GeometryError(f"View '{key}' contains a non-numeric point: {p!r}") from None
+                raise GeometryError(f"{where}: view '{key}' contains a non-numeric point: {p!r}") from None
             if not (math.isfinite(u) and math.isfinite(v)):
-                raise GeometryError(f"View '{key}' contains a non-finite point: {p!r}")
+                raise GeometryError(f"{where}: view '{key}' contains a non-finite point: {p!r}")
             out.append([u, v])
         clean[key] = {"points": out, "closed": bool(view.get("closed", len(out) >= 3))}
-
-    export = data.get("export") if isinstance(data.get("export"), dict) else {}
-    editor = data.get("editor") if isinstance(data.get("editor"), dict) else {}
-    return {**data, "views": clean, "export": export, "editor": editor}
+    return clean
 
 
 # ======================================================================
@@ -1516,6 +1661,43 @@ THEME = {
     "vertex": "#0f1115",
 }
 
+# Layer colours (2D fill, 2D outline); the 3D shades are derived from the fill.
+# The first layer keeps the InP gold of the single-layer versions.
+LAYER_COLORS = [
+    ("#d9a21b", "#ffd166"),  # gold
+    ("#3d7bd9", "#8fbfff"),  # blue
+    ("#2f9e6a", "#7ee2b0"),  # green
+    ("#8a5cd6", "#c7a8ff"),  # purple
+    ("#d0533f", "#ff9e8a"),  # coral
+    ("#1f9fb0", "#7fe0ec"),  # teal
+    ("#c24f9b", "#f5a3d6"),  # pink
+    ("#8aa524", "#cfe57a"),  # lime
+]
+
+
+def layer_colors(index):
+    """(fill, outline) colour of the layer at position index (cycles through the palette)."""
+    return LAYER_COLORS[index % len(LAYER_COLORS)]
+
+
+def mix_color(color, other, amount):
+    """Blends two #rrggbb colours: amount 0 -> color, 1 -> other."""
+    a = [int(color[i:i + 2], 16) for i in (1, 3, 5)]
+    b = [int(other[i:i + 2], 16) for i in (1, 3, 5)]
+    return "#" + "".join(f"{round(x + (y - x) * amount):02x}" for x, y in zip(a, b))
+
+
+def face_colors(base, kind):
+    """(fill, outline) of a 3D face of the given kind, shaded from the layer colour."""
+    fill = {
+        "top": mix_color(base, "#ffffff", 0.35),
+        "side": base,
+        "end": mix_color(base, "#000000", 0.12),
+        "bottom": mix_color(base, "#000000", 0.25),
+    }.get(kind, base)
+    return fill, mix_color(base, "#000000", 0.55)
+
+
 
 class FlatButton(tk.Label):
     """Flat, theme-able button (tk.Button ignores colors on macOS)."""
@@ -1803,6 +1985,11 @@ class OrthoCanvas2D(tk.Frame):
         self.cursor_uv = None
         self.snap_enabled = True
 
+        # Colours of the edited (active) layer and the other layers drawn as dashed outlines
+        self.fill_color = THEME["shape_fill"]
+        self.edge_color = THEME["shape_edge"]
+        self.background = []  # [(points, closed, outline colour), ...]
+
         # Panning state (middle-drag or Space+drag)
         self._pan_start = None
 
@@ -1937,11 +2124,14 @@ class OrthoCanvas2D(tk.Frame):
         # Guides catch the pointer within 12 px; otherwise snap to the minor grid of the current zoom
         x0, y0, x1, y1 = self._plot_rect()
         (_, fine_u), (_, fine_v) = self.tick_steps()
-        snapped_u = nearest_guide(u, self.u_guides, 12.0 * u_span / max(1.0, x1 - x0))
+        # other layers' vertices act as guides too, so layers can be aligned
+        u_guides = self.u_guides + [p[0] for pts, _, _ in self.background for p in pts]
+        v_guides = self.v_guides + [p[1] for pts, _, _ in self.background for p in pts]
+        snapped_u = nearest_guide(u, u_guides, 12.0 * u_span / max(1.0, x1 - x0))
         if snapped_u is None:
             snapped_u = round(u / fine_u) * fine_u
 
-        snapped_v = nearest_guide(v, self.v_guides, 12.0 * v_span / max(1.0, y1 - y0))
+        snapped_v = nearest_guide(v, v_guides, 12.0 * v_span / max(1.0, y1 - y0))
         if snapped_v is None:
             snapped_v = round(v / fine_v) * fine_v
 
@@ -2211,12 +2401,15 @@ class OrthoCanvas2D(tk.Frame):
         self.v_range = list(self.default_v_range)
         self.redraw()
 
-    def set_points(self, pts, closed=True):
+    def set_points(self, pts, closed=True, notify=True):
+        """Replaces the outline. notify=False: no change callback (e.g. when switching layers)."""
         self.points = [[float(p[0]), float(p[1])] for p in pts]
         self.closed = closed and len(self.points) >= 3
         self.selected_idx = None
+        self.dragging_idx = None
+        self.hover_idx = self.hover_edge_idx = None
         self._notify_point_selected()
-        if self.on_geometry_changed:
+        if notify and self.on_geometry_changed:
             self.on_geometry_changed()
         self.redraw()
 
@@ -2327,16 +2520,24 @@ class OrthoCanvas2D(tk.Frame):
                 fill=T["text_dim"],
             )
 
-        # 3. Polygon & connected segments
+        # 3a. Other layers: dashed outlines in their colours (not editable here)
+        for bg_pts, bg_closed, bg_color in self.background:
+            if len(bg_pts) < 2:
+                continue
+            coords = [coord for u, v in bg_pts for coord in self.uv_to_px(u, v)]
+            if bg_closed and len(bg_pts) >= 3:
+                coords += coords[:2]
+            c.create_line(*coords, fill=bg_color, width=1.5, dash=(6, 4))
+
+        # 3b. Polygon & connected segments of the edited layer
         px_pts = [self.uv_to_px(u, v) for u, v in self.points]
 
         flat_coords = [coord for pt in px_pts for coord in pt]
         if n >= 3 and self.closed:
-            # InP gold, matching Slide 1
-            c.create_polygon(*flat_coords, fill=T["shape_fill"], outline=T["shape_edge"], width=2)
+            c.create_polygon(*flat_coords, fill=self.fill_color, outline=self.edge_color, width=2)
         elif n >= 2:
             # Still drawing: open polyline
-            c.create_line(*flat_coords, fill=T["shape_edge"], width=2)
+            c.create_line(*flat_coords, fill=self.edge_color, width=2)
 
         # Highlight hovered edge when in edit mode
         if self.hover_edge_idx is not None and self.hover_edge_idx < n:
@@ -2363,7 +2564,7 @@ class OrthoCanvas2D(tk.Frame):
             elif is_hov:
                 fill_c, outline_c = T["accent"], "#ffffff"
             else:
-                fill_c, outline_c = T["vertex"], T["shape_edge"]
+                fill_c, outline_c = T["vertex"], self.edge_color
             c.create_oval(px - r, py - r, px + r, py + r, fill=fill_c, outline=outline_c, width=1.5)
             if is_sel or is_hov:
                 u, v = self.points[i]
@@ -2456,10 +2657,12 @@ class View3DCanvas(tk.Frame):
         self.summary_text = ""
         self.redraw()
 
-    def set_geometry(self, faces_3d, bbox_3d, summary_text=""):
+    def set_geometry(self, faces_3d, bbox_3d, summary_text="", marker_colors=None):
+        """marker_colors: {line index: colour} for the '■' layer markers of the info card."""
         self.faces_3d = faces_3d
         self.bbox_3d = bbox_3d
         self.summary_text = summary_text
+        self.marker_colors = marker_colors or {}
         self.redraw()
 
     def _on_mouse_down(self, event):
@@ -2578,29 +2781,18 @@ class View3DCanvas(tk.Frame):
 
         # Depth-sort faces (Painter's algorithm)
         rendered_faces = []
-        for verts, face_kind in self.faces_3d:
+        for face in self.faces_3d:
+            verts, face_kind = face[0], face[1]
+            base = face[2] if len(face) > 2 else THEME["shape_fill"]  # optional layer colour
             proj = [self._project_point(vx, vy, vz, cx, cy, scale) for vx, vy, vz in verts]
             avg_depth = sum(p[2] for p in proj) / len(proj)
-            rendered_faces.append((avg_depth, proj, face_kind))
+            rendered_faces.append((avg_depth, proj, face_colors(base, face_kind)))
 
         rendered_faces.sort(key=lambda item: item[0])
 
         # Draw sorted faces
-        for _, proj, face_kind in rendered_faces:
+        for _, proj, (fill_color, edge_color) in rendered_faces:
             coords = [c for pt in proj for c in (pt[0], pt[1])]
-            if face_kind == "top":
-                fill_color = "#ffd43b"
-                edge_color = "#8c6d1f"
-            elif face_kind == "bottom":
-                fill_color = "#cca000"
-                edge_color = "#665000"
-            elif face_kind == "end":
-                fill_color = "#e6ac00"
-                edge_color = "#5c4500"
-            else:
-                fill_color = "#f59f00"
-                edge_color = "#704800"
-
             self.canvas.create_polygon(
                 *coords,
                 fill=fill_color,
@@ -2624,6 +2816,14 @@ class View3DCanvas(tk.Frame):
                 bx0 - 10, by0 - 8, bx1 + 10, by1 + 8, fill=THEME["panel_bg"], outline=THEME["border"]
             )
             self.canvas.tag_lower(card, tid)
+            # colour the layer markers: a coloured '■' drawn exactly over the white one
+            markers = getattr(self, "marker_colors", {})
+            if markers:
+                line_h = (by1 - by0) / max(1, len(self.summary_text.splitlines()))
+                for line, color in markers.items():
+                    self.canvas.create_text(
+                        22, by0 + line * line_h, text="■", font=(FONT_MONO, 10), fill=color, anchor="nw"
+                    )
 
         self._draw_axes_triad(w, h)
 
@@ -2687,15 +2887,21 @@ class LumericalGeometryApp:
         apply_ttk_dark_style(self.root)
 
         self.active_view = None
-        self.geometry = None  # last reconstructed Geometry3D
+        self.geometry = None  # last reconstruction: [(gds_layer, Geometry3D), ...]
+        # Layers: each has its own GDS layer/datatype and its own three views. The
+        # active layer is edited in the 2D views; its stored copy is refreshed by
+        # _sync_active_layer() whenever the whole model is needed.
+        self.layers = [self._new_layer(DEFAULT_GDS_LAYER)]
+        self.active_layer = 0
         self.geometry_outdated = False  # views edited since the last reconstruction
-        self._undo_stack = []  # earlier states of the three views (see _view_state)
+        self._undo_stack = []  # earlier states of all layers (see _model_state)
         self._redo_stack = []
         self._commit_pending = False
 
         self._build_ui()
-        self._history_state = self._view_state()
+        self._history_state = self._model_state()
         self._build_menu()
+        self._load_layer(0)
         self._set_window_icon()
         self._update_title()
         self.root.protocol("WM_DELETE_WINDOW", self.quit_app)
@@ -2719,9 +2925,10 @@ class LumericalGeometryApp:
 
         title_box = tk.Frame(header, bg=T["bar_bg"])
         title_box.pack(side=tk.LEFT)
-        tk.Label(
+        self.title_mark = tk.Label(
             title_box, text="◆", font=(FONT_UI, 18), bg=T["bar_bg"], fg=T["shape_edge"]
-        ).pack(side=tk.LEFT, padx=(0, 8))
+        )
+        self.title_mark.pack(side=tk.LEFT, padx=(0, 8))
         tk.Label(
             title_box, text=APP_NAME, font=(FONT_UI, 15, "bold"), bg=T["bar_bg"], fg=T["text"]
         ).pack(side=tk.LEFT)
@@ -2751,13 +2958,33 @@ class LumericalGeometryApp:
         )
         Tooltip(self.ent_cell, "GDS / gdsfactory cell name")
 
-        self.ent_layer = themed_entry(header, 5)
-        self.ent_layer.insert(0, f"{DEFAULT_GDS_LAYER[0]}/{DEFAULT_GDS_LAYER[1]}")
-        self.ent_layer.pack(side=tk.RIGHT, ipady=3)
-        tk.Label(header, text="Layer", font=(FONT_UI, 10), bg=T["bar_bg"], fg=T["text_muted"]).pack(
-            side=tk.RIGHT, padx=(12, 5)
+        # Layer: colour swatch | layer selector | + Add layer
+        FlatButton(
+            header, "＋ Add layer", self.add_layer, size=11, padx=9, pady=4,
+            tooltip=f"Add a new layer (next free GDS layer number) and continue drawing on it  ({mod}+L)",
+        ).pack(side=tk.RIGHT, padx=(6, 0))
+        self.layer_var = tk.StringVar()
+        self.cmb_layer = ttk.Combobox(
+            header,
+            textvariable=self.layer_var,
+            state="readonly",
+            width=6,
+            style="Dark.TCombobox",
+            font=(FONT_UI, 11),
+            postcommand=lambda: self.root.after(1, self._color_layer_list),
         )
-        Tooltip(self.ent_layer, "GDS layer/datatype, e.g. 1/0")
+        self.cmb_layer.pack(side=tk.RIGHT)
+        self.cmb_layer.bind("<<ComboboxSelected>>", self._on_layer_selected)
+        Tooltip(
+            self.cmb_layer,
+            f"GDS layer/datatype you are drawing on — choose another layer to switch  ({mod}+1…9)\n"
+            "Change the number or delete the layer in the Layer menu",
+        )
+        self.layer_swatch = tk.Label(header, text="■", font=(FONT_UI, 16), bg=T["bar_bg"], fg=T["shape_fill"])
+        self.layer_swatch.pack(side=tk.RIGHT, padx=(0, 3))
+        tk.Label(header, text="Layer", font=(FONT_UI, 10), bg=T["bar_bg"], fg=T["text_muted"]).pack(
+            side=tk.RIGHT, padx=(12, 4)
+        )
 
         self.format_var = tk.StringVar(value=next(iter(EXPORT_FORMATS)))
         cmb_format = ttk.Combobox(
@@ -2805,7 +3032,7 @@ class LumericalGeometryApp:
         ).pack(side=tk.LEFT, padx=(0, 6))
         FlatButton(
             tools, "Clear all", self.clear_all, variant="danger", size=11, padx=10, pady=4,
-            tooltip="Remove all points from every view",
+            tooltip="Remove all points from the three views of the current layer (undo with ⌘Z / Ctrl+Z)",
         ).pack(side=tk.LEFT)
 
         vsep(tools).pack(side=tk.LEFT, fill=tk.Y, padx=14, pady=2)
@@ -3052,6 +3279,17 @@ class LumericalGeometryApp:
         geom_menu.add_command(label="Reset All Views", command=self.reset_all_views)
         menubar.add_cascade(label="Geometry", menu=geom_menu)
 
+        self.layer_menu = tk.Menu(menubar, tearoff=False, postcommand=self._rebuild_layer_menu)
+        self.layer_index_var = tk.IntVar(value=0)
+        menubar.add_cascade(label="Layer", menu=self.layer_menu)
+        self.root.bind(f"<{self._accel}-l>", lambda e: self._shortcut("add_layer", self.add_layer))
+        for num in range(1, 10):
+            self.root.bind(
+                f"<{self._accel}-Key-{num}>",
+                lambda e, i=num - 1: self._shortcut(f"layer{i}", lambda: self.select_layer(i)),
+            )
+        self._rebuild_layer_menu()
+
         help_menu = tk.Menu(menubar, tearoff=False)
         help_menu.add_command(label="Check for Updates…", command=lambda: self.check_for_updates(manual=True))
         self.check_updates_var = tk.BooleanVar(value=bool(self.config.get("check_updates_on_start", True)))
@@ -3078,8 +3316,7 @@ class LumericalGeometryApp:
         # Export settings belong to the model: editing them marks it as changed
         self.format_var.trace_add("write", lambda *a: self._set_dirty(True))
         mark = self.root.register(lambda: self._set_dirty(True) or True)
-        for entry in (self.ent_layer, self.ent_cell):
-            entry.config(validate="key", validatecommand=(mark,))
+        self.ent_cell.config(validate="key", validatecommand=(mark,))
 
     def _rebuild_recent_menu(self):
         self.recent_menu.delete(0, "end")
@@ -3152,26 +3389,33 @@ class LumericalGeometryApp:
 
     def model_data(self):
         """The current model as a .3dgg document (dict)."""
-        views = {key: (view.points, view.closed) for key, view in self._views().items()}
-        export = {
-            "format": self.format_var.get(),
-            "gds_layer": self.ent_layer.get().strip(),
-            "cell_name": self.ent_cell.get().strip(),
-        }
-        return model_to_dict(views, export, self.snap_var.get())
+        self._sync_active_layer()
+        layers = [
+            {"gds_layer": format_layer(layer["spec"]), "views": {k: tuple(v) for k, v in layer["views"].items()}}
+            for layer in self.layers
+        ]
+        export = {"format": self.format_var.get(), "cell_name": self.ent_cell.get().strip()}
+        return model_to_dict(layers, export, self.snap_var.get(), active_layer=self.active_layer)
 
     def apply_model(self, data):
-        """Loads a validated .3dgg document (see read_model) into the views and export settings."""
-        for key, view in self._views().items():
-            view.set_points(data["views"][key]["points"], closed=data["views"][key]["closed"])
+        """Loads a validated .3dgg document (see read_model) into the layers, views and export settings."""
+        self.layers = [
+            {
+                "spec": parse_layer_spec(layer["gds_layer"]),
+                "views": {k: [[list(p) for p in v["points"]], v["closed"]] for k, v in layer["views"].items()},
+            }
+            for layer in data["layers"]
+        ]
+        self._load_layer(data.get("active_layer", 0))
+        for view in self._views().values():
             view.reset_view()
+        self._set_dirty(True)
         export = data.get("export", {})
         if export.get("format") in EXPORT_FORMATS:
             self.format_var.set(export["format"])
-        for entry, key in ((self.ent_layer, "gds_layer"), (self.ent_cell, "cell_name")):
-            if isinstance(export.get(key), str) and export[key].strip():
-                entry.delete(0, tk.END)
-                entry.insert(0, export[key].strip())
+        if isinstance(export.get("cell_name"), str) and export["cell_name"].strip():
+            self.ent_cell.delete(0, tk.END)
+            self.ent_cell.insert(0, export["cell_name"].strip())
         if "snap" in data.get("editor", {}):
             self.snap_var.set(bool(data["editor"]["snap"]))
             self.snap_btn._refresh()
@@ -3181,7 +3425,7 @@ class LumericalGeometryApp:
         self.view_3d.set_state("empty")
         self.geometry = None
         self.geometry_outdated = False
-        if all(len(v.points) >= 3 for v in self._views().values()):
+        if any(all(len(v[0]) >= 3 for v in layer["views"].values()) for layer in self.layers):
             self.generate_geometry(quiet=True)
 
     def confirm_discard(self):
@@ -3206,10 +3450,11 @@ class LumericalGeometryApp:
         if not self.confirm_discard():
             return
         self.clear_all()
+        self.layers = [self._new_layer(DEFAULT_GDS_LAYER)]
+        self._load_layer(0)
         self.format_var.set(next(iter(EXPORT_FORMATS)))
-        for entry, value in ((self.ent_layer, f"{DEFAULT_GDS_LAYER[0]}/{DEFAULT_GDS_LAYER[1]}"), (self.ent_cell, DEFAULT_CELL_NAME)):
-            entry.delete(0, tk.END)
-            entry.insert(0, value)
+        self.ent_cell.delete(0, tk.END)
+        self.ent_cell.insert(0, DEFAULT_CELL_NAME)
         self.reset_all_views()
         self.reset_history()
         self.model_path = None
@@ -3646,13 +3891,166 @@ class LumericalGeometryApp:
             self.active_view.delete_selected_point()
 
     # ==================================================================
+    # Layers
+    # ==================================================================
+    @staticmethod
+    def _new_layer(spec):
+        return {"spec": tuple(spec), "views": {k: [[], False] for k in VIEW_KEYS}}
+
+    def _sync_active_layer(self):
+        """Copies the points of the 2D views into the stored active layer."""
+        if not hasattr(self, "view_yz"):
+            return  # still building the window
+        layer = self.layers[self.active_layer]
+        for key, view in self._views().items():
+            layer["views"][key] = [[list(p) for p in view.points], bool(view.closed)]
+
+    def _load_layer(self, index):
+        """Shows layer `index` in the 2D views (editable); the other layers become dashed outlines."""
+        self.active_layer = max(0, min(index, len(self.layers) - 1))
+        fill, edge = layer_colors(self.active_layer)
+        for key, view in self._views().items():
+            pts, closed = self.layers[self.active_layer]["views"][key]
+            view.fill_color, view.edge_color = fill, edge
+            view.background = [
+                (layer["views"][key][0], layer["views"][key][1], layer_colors(i)[1])
+                for i, layer in enumerate(self.layers)
+                if i != self.active_layer
+            ]
+            view.set_points(pts, closed=closed, notify=False)
+        self._refresh_layer_ui()
+
+    def _refresh_layer_ui(self):
+        fill, edge = layer_colors(self.active_layer)
+        specs = [format_layer(layer["spec"]) for layer in self.layers]
+        self.cmb_layer.config(values=specs)
+        self.layer_var.set(specs[self.active_layer])
+        self.cmb_layer.selection_clear()
+        self.layer_swatch.config(fg=fill)
+        self.title_mark.config(fg=edge)
+        self.layer_index_var.set(self.active_layer)
+
+    def _color_layer_list(self):
+        """Colours the entries of the opened layer list like the layers."""
+        try:
+            popdown = self.cmb_layer.tk.call("ttk::combobox::PopdownWindow", self.cmb_layer)
+            for i in range(len(self.layers)):
+                self.cmb_layer.tk.call(f"{popdown}.f.l", "itemconfigure", i, "-foreground", layer_colors(i)[1])
+        except tk.TclError:
+            pass  # cosmetic only
+
+    def _rebuild_layer_menu(self):
+        menu = self.layer_menu
+        menu.delete(0, "end")
+        accel = "Command-" if sys.platform == "darwin" else "Ctrl+"
+        menu.add_command(
+            label="Add New Layer", accelerator=f"{accel}L", command=lambda: self._shortcut("add_layer", self.add_layer)
+        )
+        menu.add_command(label="Change Layer Number…", command=self.change_layer_number)
+        menu.add_command(label="Delete Layer…", command=self.delete_layer)
+        menu.add_separator()
+        for i, layer in enumerate(self.layers):
+            options = {"foreground": layer_colors(i)[1]} if sys.platform != "darwin" else {}
+            menu.add_radiobutton(
+                label=f"Layer {format_layer(layer['spec'])}",
+                variable=self.layer_index_var,
+                value=i,
+                accelerator=f"{accel}{i + 1}" if i < 9 else None,
+                command=lambda i=i: self.select_layer(i),
+                **options,
+            )
+
+    def _on_layer_selected(self, event=None):
+        self.cmb_layer.selection_clear()
+        index = self.cmb_layer.current()
+        if index >= 0:
+            self.select_layer(index)
+
+    def select_layer(self, index):
+        """Continues drawing on another layer (its points stay as they were)."""
+        if not 0 <= index < len(self.layers):
+            return
+        self._commit_history()
+        if index != self.active_layer:
+            self._sync_active_layer()
+            self._load_layer(index)
+        else:
+            self._refresh_layer_ui()
+        self.set_status(f"Drawing on layer {format_layer(self.layers[index]['spec'])}.")
+
+    def add_layer(self):
+        """Adds an empty layer with the next free GDS layer number and switches to it."""
+        self._commit_history()
+        self._sync_active_layer()
+        spec = next_free_layer([layer["spec"] for layer in self.layers])
+        self.layers.append(self._new_layer(spec))
+        self._load_layer(len(self.layers) - 1)
+        self._on_geometry_changed()
+        self._commit_history()
+        self.set_status(
+            f"Added layer {format_layer(spec)} — draw its Top, Side and Front views. "
+            "The other layers are shown as dashed outlines; switch with the Layer selector."
+        )
+
+    def change_layer_number(self):
+        current = format_layer(self.layers[self.active_layer]["spec"])
+        text = simpledialog.askstring(
+            "Change Layer Number",
+            f"New GDS layer/datatype for layer {current} (e.g. 2/0):",
+            initialvalue=current,
+            parent=self.root,
+        )
+        if text is None:
+            return
+        try:
+            spec = parse_layer_spec(text)
+        except GeometryError as exc:
+            messagebox.showerror("Invalid GDS Layer", str(exc), parent=self.root)
+            return
+        if any(i != self.active_layer and layer["spec"] == spec for i, layer in enumerate(self.layers)):
+            messagebox.showerror("Layer Exists", f"Layer {format_layer(spec)} already exists.", parent=self.root)
+            return
+        self._commit_history()
+        self.layers[self.active_layer]["spec"] = spec
+        self._refresh_layer_ui()
+        self._on_geometry_changed()
+        self._commit_history()
+        self.set_status(f"Layer {current} is now layer {format_layer(spec)}.")
+
+    def delete_layer(self, confirm=True):
+        if len(self.layers) == 1:
+            messagebox.showinfo(
+                "Delete Layer", "The only layer cannot be deleted. Use Clear all to remove its points.", parent=self.root
+            )
+            return
+        self._sync_active_layer()
+        name = format_layer(self.layers[self.active_layer]["spec"])
+        has_points = any(v[0] for v in self.layers[self.active_layer]["views"].values())
+        if confirm and has_points and not messagebox.askyesno(
+            "Delete Layer", f"Delete layer {name} and its drawing?\n\nYou can undo this.", parent=self.root
+        ):
+            return
+        self._commit_history()
+        del self.layers[self.active_layer]
+        self._load_layer(min(self.active_layer, len(self.layers) - 1))
+        self._on_geometry_changed()
+        self._commit_history()
+        self.set_status(f"Deleted layer {name}.")
+
+    # ==================================================================
     # Undo / redo (snapshots of the points of the three 2D views)
     # ==================================================================
     HISTORY_LIMIT = 300
 
-    def _view_state(self):
+    def _model_state(self):
+        """Hashable snapshot of all layers (GDS layer + points of the three views)."""
+        self._sync_active_layer()
         return tuple(
-            (tuple(tuple(p) for p in view.points), bool(view.closed)) for view in self._views().values()
+            (
+                tuple(layer["spec"]),
+                tuple((tuple(tuple(p) for p in layer["views"][k][0]), bool(layer["views"][k][1])) for k in VIEW_KEYS),
+            )
+            for layer in self.layers
         )
 
     def _schedule_commit(self):
@@ -3666,7 +4064,7 @@ class LumericalGeometryApp:
         self._commit_pending = False
         if any(view.dragging_idx is not None for view in self._views().values()):
             return  # committed when the mouse button is released
-        state = self._view_state()
+        state = self._model_state()
         if state != self._history_state:
             self._undo_stack.append(self._history_state)
             del self._undo_stack[: -self.HISTORY_LIMIT]
@@ -3676,13 +4074,20 @@ class LumericalGeometryApp:
     def reset_history(self):
         self._undo_stack.clear()
         self._redo_stack.clear()
-        self._history_state = self._view_state()
+        self._history_state = self._model_state()
 
     def _restore_state(self, state):
+        current = self._model_state()
         self._history_state = state
-        for view, (points, closed) in zip(self._views().values(), state):
-            if (tuple(tuple(p) for p in view.points), bool(view.closed)) != (points, closed):
-                view.set_points([list(p) for p in points], closed=closed)
+        self.layers = [
+            {"spec": tuple(spec), "views": {k: [[list(p) for p in pts], closed] for k, (pts, closed) in zip(VIEW_KEYS, views)}}
+            for spec, views in state
+        ]
+        # Show the layer that the undo / redo changed
+        changed = [i for i, layer in enumerate(state) if i >= len(current) or current[i] != layer]
+        target = changed[0] if changed else self.active_layer
+        self._load_layer(min(target, len(self.layers) - 1))
+        self._on_geometry_changed()
 
     def undo(self):
         self._commit_history()  # include a change that is still waiting to be recorded
@@ -3723,7 +4128,10 @@ class LumericalGeometryApp:
         self.geometry = None
         self.geometry_outdated = False
         self.view_3d.set_state("empty")
-        self.set_status("Cleared all views. Draw connected points in (x-y), (x-z) and (y-z).")
+        self.set_status(
+            f"Cleared the views of layer {format_layer(self.layers[self.active_layer]['spec'])}. "
+            "Draw connected points in (x-y), (x-z) and (y-z)."
+        )
 
     def mirror_view(self, view, axis):
         """Makes the outline of one 2D view symmetric about u = 0 or v = 0 (undoable)."""
@@ -3752,51 +4160,74 @@ class LumericalGeometryApp:
     # ==================================================================
     def generate_geometry(self, quiet=False):
         """
-        Reconstructs the 3D solid from the current 2D views and renders it in the
-        3D view. Returns the Geometry3D, or None if the views are incomplete
-        (quiet=True: report only in the status bar, no dialog).
+        Reconstructs the 3D solid of every drawn layer and renders them in the 3D
+        view, each in its layer colour. Returns [(gds_layer, Geometry3D), ...], or
+        None if a layer is incomplete (quiet=True: report only in the status bar).
         """
+        self._sync_active_layer()
         try:
-            geom = reconstruct_geometry(self.view_xy.points, self.view_xz.points, self.view_yz.points)
+            geoms = reconstruct_layers(
+                [(layer["spec"], {k: v[0] for k, v in layer["views"].items()}) for layer in self.layers]
+            )
         except GeometryError as exc:
             self.set_status(f"Cannot generate geometry: {exc}", "error")
             if not quiet:
                 messagebox.showwarning("Cannot Generate Geometry", str(exc))
             return None
 
-        # Mark all 3 views as closed polygons so subsequent clicks edit nicely
-        self.view_xy.close_polygon()
-        self.view_xz.close_polygon()
-        self.view_yz.close_polygon()
+        # Mark the outlines as closed polygons so subsequent clicks edit nicely
+        for view in self._views().values():
+            view.close_polygon()
+        for layer in self.layers:
+            for view in layer["views"].values():
+                view[1] = len(view[0]) >= 3
+        self._load_layer(self.active_layer)  # refresh the dashed outlines of the other layers
+        self._commit_history()
 
-        self.geometry = geom
+        self.geometry = geoms
         self.geometry_outdated = False
 
-        xmin, xmax, ymin, ymax, zmin, zmax = geom.bbox
-        section = "rectangle" if geom.section_is_rect else f"{len(geom.section)}-point outline"
-        summary = (
-            f"Material  InP     Sections  {len(geom.segments)}\n"
-            f"Cross-section  {section} (Front view)\n"
-            f"x  [{xmin:g}, {xmax:g}] μm   L = {xmax - xmin:g} μm\n"
-            f"y  [{ymin:g}, {ymax:g}] μm   W = {ymax - ymin:g} μm\n"
-            f"z  [{zmin:g}, {zmax:g}] μm   T = {(zmax - zmin)*1000:g} nm"
+        color_of = {layer["spec"]: layer_colors(i)[0] for i, layer in enumerate(self.layers)}
+        faces = [(verts, kind, color_of[lay]) for lay, g in geoms for verts, kind in g.faces]
+        boxes = [g.bbox for _, g in geoms]
+        bbox = tuple(
+            fn(b[axis] for b in boxes) for axis in range(6) for fn in ((min,) if axis % 2 == 0 else (max,))
         )
-        self.view_3d.set_geometry(geom.faces, geom.bbox, summary_text=summary)
+        xmin, xmax, ymin, ymax, zmin, zmax = bbox
+        lines = [f"Material  InP     Layers  {len(geoms)}"]
+        for lay, g in geoms:
+            z0, z1 = g.z_span
+            section = "rect" if g.section_is_rect else f"{len(g.section)}-pt"
+            lines.append(
+                f"■ {format_layer(lay):<6} z [{z0:g}, {z1:g}] μm  T = {(z1 - z0) * 1000:g} nm  "
+                f"{len(g.segments)} sec · {section}"
+            )
+        lines += [
+            f"x  [{xmin:g}, {xmax:g}] μm   L = {xmax - xmin:g} μm",
+            f"y  [{ymin:g}, {ymax:g}] μm   W = {ymax - ymin:g} μm",
+            f"z  [{zmin:g}, {zmax:g}] μm   T = {(zmax - zmin) * 1000:g} nm",
+        ]
+        markers = {1 + i: color_of[lay] for i, (lay, _) in enumerate(geoms)}
+        self.view_3d.set_geometry(faces, bbox, summary_text="\n".join(lines), marker_colors=markers)
         self.view_3d.set_state("ok")
+        skipped = [
+            format_layer(layer["spec"]) for layer in self.layers if layer["spec"] not in {lay for lay, _ in geoms}
+        ]
         self.set_status(
-            f"3D geometry generated — {len(geom.segments)} longitudinal section(s), "
-            f"L = {xmax-xmin:g} μm, W_max = {ymax-ymin:g} μm, T = {(zmax-zmin)*1000:g} nm.",
+            f"3D geometry generated — {len(geoms)} layer(s), L = {xmax - xmin:g} μm, "
+            f"W_max = {ymax - ymin:g} μm, total T = {(zmax - zmin) * 1000:g} nm."
+            + (f"  Empty layer(s) not included: {', '.join(skipped)}." if skipped else ""),
             "ok",
         )
-        return geom
+        return geoms
 
     # ==================================================================
     # File export (.lsf / .gds / gdsfactory .py)
     # ==================================================================
     def build_lsf_content(self):
         """Builds the Ansys Lumerical .lsf script from the *current* drawing."""
-        geom = self.generate_geometry()
-        return build_lsf(geom) if geom else None
+        geoms = self.generate_geometry()
+        return build_lsf(geoms) if geoms else None
 
     def generate_file(self):
         """Exports the current geometry in the format selected in the export bar."""
@@ -3808,11 +4239,7 @@ class LumericalGeometryApp:
 
         fmt_label = self.format_var.get()
         exts = EXPORT_FORMATS[fmt_label]
-        try:
-            layer = parse_layer_spec(self.ent_layer.get())
-        except GeometryError as exc:
-            messagebox.showerror("Invalid GDS Layer", str(exc))
-            return
+        layer = geom[0][0]
         cell_name = sanitize_cell_name(self.ent_cell.get())
 
         file_types = {
@@ -3873,7 +4300,7 @@ class LumericalGeometryApp:
         note = ""
         if ".py" in exts:
             note = "\n\nRun the .py with Python (gdsfactory installed) to generate its .gds; add --show to view it."
-        if ".gds" in exts and not geom.z_is_uniform:
+        if ".gds" in exts and any(not g.z_is_uniform for _, g in geom):
             note += "\n\nNote: the side view has an x-dependent thickness, which a 2D GDS file cannot store."
         messagebox.showinfo("Files Generated", f"Saved in {folder}:\n\n" + "\n".join(written) + note)
 

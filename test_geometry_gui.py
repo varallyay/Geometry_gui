@@ -224,9 +224,9 @@ def test_gdsfactory_script_is_valid_python(preset):
     tree = ast.parse(src)
     funcs = {n.name for n in tree.body if isinstance(n, ast.FunctionDef)}
     assert {"InP_wg", "InP_wg_sections", "get_layer_stack"} <= funcs
-    assert "LAYER = (5, 1)" in src
-    assert "THICKNESS_UM = 0.25" in src
-    assert "ZMIN_UM = -0.125" in src
+    assert '"layer": (5, 1),' in src
+    assert '"thickness_um": 0.25,' in src
+    assert '"zmin_um": -0.125,' in src
 
 
 def test_export_rejects_shadowing_script_name(preset, tmp_path):
@@ -292,10 +292,104 @@ def test_model_round_trip(tmp_path):
     gg.write_model(str(path), gg.model_to_dict(preset_views(), export, snap=False))
     data = gg.read_model(str(path))
     assert data["format"] == "3dgg" and data["generator"] == f"{gg.APP_NAME} {gg.__version__}"
+    assert [layer["gds_layer"] for layer in data["layers"]] == ["5/1"]  # single views dict -> one layer
     for key in gg.VIEW_KEYS:
-        assert data["views"][key]["points"] == [[float(u), float(v)] for u, v in gg.SLIDE1_PRESET[key]]
-        assert data["views"][key]["closed"] is True
-    assert data["export"] == export and data["editor"] == {"snap": False}
+        view = data["layers"][0]["views"][key]
+        assert view["points"] == [[float(u), float(v)] for u, v in gg.SLIDE1_PRESET[key]]
+        assert view["closed"] is True
+    assert data["export"] == {"format": "GDSII layout (.gds)", "cell_name": "taper"}
+    assert data["editor"] == {"snap": False}
+
+
+def test_model_reads_version_1_files(tmp_path):
+    # file written by 0.3.x: one set of views, GDS layer in the export settings
+    path = tmp_path / "old.3dgg"
+    old = {
+        "format": "3dgg", "format_version": 1,
+        "views": {k: {"points": gg.SLIDE1_PRESET[k], "closed": True} for k in gg.VIEW_KEYS},
+        "export": {"format": "GDSII layout (.gds)", "gds_layer": "7/2", "cell_name": "old"},
+    }
+    path.write_text(__import__("json").dumps(old))
+    data = gg.read_model(str(path))
+    assert [layer["gds_layer"] for layer in data["layers"]] == ["7/2"]
+    assert data["layers"][0]["views"]["xy"]["points"][0] == [-300.0, -0.05]
+    assert data["active_layer"] == 0
+
+
+def two_layers():
+    rib = {"xy": [[-50, -1], [50, -1], [50, 1], [-50, 1]], "xz": [[-50, 0.125], [50, 0.125], [50, 0.4], [-50, 0.4]],
+           "yz": [[-1, 0.125], [1, 0.125], [1, 0.4], [-1, 0.4]]}
+    return [((1, 0), dict(gg.SLIDE1_PRESET)), ((2, 0), rib)]
+
+
+def test_model_round_trip_several_layers(tmp_path):
+    layers = [{"gds_layer": gg.format_layer(spec), "views": {k: (pts, True) for k, pts in views.items()}}
+              for spec, views in two_layers()]
+    path = tmp_path / "stack.3dgg"
+    gg.write_model(str(path), gg.model_to_dict(layers, {"cell_name": "stack"}, active_layer=1))
+    data = gg.read_model(str(path))
+    assert data["format_version"] == 2 and data["active_layer"] == 1
+    assert [layer["gds_layer"] for layer in data["layers"]] == ["1/0", "2/0"]
+    assert data["layers"][1]["views"]["xz"]["points"][2] == [50.0, 0.4]
+
+
+def test_read_model_rejects_duplicate_layers(tmp_path):
+    views = {k: {"points": [], "closed": False} for k in gg.VIEW_KEYS}
+    doc = {"format": "3dgg", "format_version": 2, "layers": [{"gds_layer": "1/0", "views": views}] * 2}
+    path = tmp_path / "dup.3dgg"
+    path.write_text(__import__("json").dumps(doc))
+    with pytest.raises(gg.GeometryError, match="twice"):
+        gg.read_model(str(path))
+
+
+def test_reconstruct_layers_skips_empty_and_names_incomplete_layer():
+    layers = two_layers() + [((3, 0), {"xy": [], "xz": [], "yz": []})]
+    geoms = gg.reconstruct_layers(layers)
+    assert [lay for lay, _ in geoms] == [(1, 0), (2, 0)]
+    assert geoms[1][1].z_span == pytest.approx((0.125, 0.4))
+    broken = two_layers() + [((3, 0), {"xy": [[0, 0], [1, 0], [1, 1]], "xz": [], "yz": []})]
+    with pytest.raises(gg.GeometryError, match="Layer 3/0"):
+        gg.reconstruct_layers(broken)
+    with pytest.raises(gg.GeometryError):
+        gg.reconstruct_layers([((1, 0), {"xy": [], "xz": [], "yz": []})])
+
+
+def test_next_free_layer():
+    assert gg.next_free_layer([(1, 0)]) == (2, 0)
+    assert gg.next_free_layer([(1, 0), (5, 2), (3, 0)]) == (6, 0)
+
+
+def test_lsf_several_layers():
+    lsf = gg.build_lsf(gg.reconstruct_layers(two_layers()))
+    assert 'set("name", "Layer_1_0");' in lsf and 'set("name", "Layer_2_0");' in lsf
+    assert 'addtogroup("Layer_2_0");' in lsf
+    assert "t_z_L2_0 = 275 * nm;" in lsf
+    assert "V_L1_0_all" in lsf and "V_L2_0_all" in lsf
+    assert lsf.count("{") == lsf.count("}") and lsf.count("[") == lsf.count("]")
+
+
+@pytest.mark.skipif(not HAS_KLAYOUT, reason="klayout not installed")
+@pytest.mark.parametrize("backend", ["builtin", "klayout"])
+def test_gds_several_layers(tmp_path, backend):
+    path = tmp_path / "stack.gds"
+    gg.write_gds(gg.reconstruct_layers(two_layers()), path, backend=backend)
+    _, _, shapes = read_gds_polygons(path)
+    assert set(shapes) == {(1, 0), (2, 0)}
+    assert shapes[(2, 0)] == [sorted([(-50000, -1000), (50000, -1000), (50000, 1000), (-50000, 1000)])]
+
+
+@pytest.mark.skipif(not (HAS_GDSFACTORY and HAS_KLAYOUT), reason="gdsfactory not installed")
+def test_gdsfactory_script_several_layers(tmp_path):
+    script = tmp_path / "stack.py"
+    gg.export_geometry(gg.reconstruct_layers(two_layers()), str(script), cell_name="stack")
+    check = subprocess.run(
+        [sys.executable, "-c", "import stack; c = stack.stack(); c.write_gds('s.gds'); "
+         "s = stack.get_layer_stack(); print(sorted(s.layers), s.layers['layer_2_0'].zmin, "
+         "len(list(c.shapes(c.kcl.layer(2, 0)).each())))"],
+        cwd=tmp_path, capture_output=True, text=True, timeout=300,
+    )
+    assert check.returncode == 0, check.stderr
+    assert check.stdout.split() == ["['layer_1_0',", "'layer_2_0']", "0.125", "1"]
 
 
 @pytest.mark.parametrize(
@@ -611,3 +705,70 @@ def test_gui_snap_follows_zoom(app):
     u, _ = view.snap_uv(0.01234, 0.0)
     assert abs(u - 0.01234) <= fine / 2 + 1e-12
     assert u / fine == pytest.approx(round(u / fine))
+
+
+# ----------------------------------------------------------------------
+# GUI: layers
+# ----------------------------------------------------------------------
+def test_gui_layers_switch_and_keep_drawings(app):
+    app.load_slide1_preset()
+    first_xy = [list(p) for p in app.view_xy.points]
+    app.add_layer()
+    assert app.active_layer == 1 and app.layer_var.get() == "2/0"
+    assert app.view_xy.points == []  # new layer starts empty
+    assert app.view_xy.fill_color == gg.layer_colors(1)[0]
+    assert [bg[0] for bg in app.view_xy.background] == [first_xy]  # layer 1 shown as outline
+    app.view_xy.set_points([[-50, -1], [50, -1], [50, 1], [-50, 1]])
+    app.select_layer(0)  # back to the first layer: its drawing is unchanged
+    assert app.view_xy.points == first_xy
+    app.select_layer(1)
+    assert app.view_xy.points == [[-50, -1], [50, -1], [50, 1], [-50, 1]]
+
+
+def test_gui_generate_and_save_several_layers(app, tmp_path):
+    app.load_slide1_preset()
+    app.add_layer()
+    for (key, view), pts in zip(app._views().items(), two_layers()[1][1].values()):
+        view.set_points(pts)
+    geoms = app.generate_geometry(quiet=True)
+    assert [lay for lay, _ in geoms] == [(1, 0), (2, 0)]
+    colours = {face[2] for face in app.view_3d.faces_3d}
+    assert colours == {gg.layer_colors(0)[0], gg.layer_colors(1)[0]}
+
+    path = tmp_path / "stack.3dgg"
+    assert app.save_model_to(str(path))
+    app.new_model()
+    assert len(app.layers) == 1 and app.view_xy.points == []
+    assert app.open_model_path(str(path), confirm=False)
+    assert [gg.format_layer(layer["spec"]) for layer in app.layers] == ["1/0", "2/0"]
+    assert app.active_layer == 1 and app.view_xy.points == [[-50, -1], [50, -1], [50, 1], [-50, 1]]
+    assert len(app.geometry) == 2
+
+
+def test_gui_undo_add_and_delete_layer(app):
+    app.load_slide1_preset()
+    app._commit_history()
+    app.add_layer()
+    app.view_xy.set_points([[0, 0], [1, 0], [1, 1]])
+    app._commit_history()
+    app.delete_layer(confirm=False)
+    assert len(app.layers) == 1 and app.active_layer == 0
+    app.undo()  # layer 2/0 comes back with its drawing, and is shown
+    assert len(app.layers) == 2 and app.active_layer == 1
+    assert app.view_xy.points == [[0, 0], [1, 0], [1, 1]]
+    app.undo()
+    app.undo()  # before the layer was added
+    assert len(app.layers) == 1 and app.active_layer == 0
+    assert len(app.view_xy.points) == 12
+
+
+def test_gui_change_layer_number(app, monkeypatch):
+    app.add_layer()
+    monkeypatch.setattr(gg.simpledialog, "askstring", lambda *a, **k: "1/0")
+    errors = []
+    monkeypatch.setattr(gg.messagebox, "showerror", lambda *a, **k: errors.append(a))
+    app.change_layer_number()  # 1/0 is taken
+    assert errors and app.layer_var.get() == "2/0"
+    monkeypatch.setattr(gg.simpledialog, "askstring", lambda *a, **k: "10/3")
+    app.change_layer_number()
+    assert app.layer_var.get() == "10/3" and app.layers[1]["spec"] == (10, 3)
