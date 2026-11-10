@@ -14,6 +14,12 @@ Features:
     (Top x-y, Side x-z, Front y-z). The top view gives the width along x, the
     side view the thickness along x, and the front view the cross-section
     shape, which is stretched at every x to the local width and thickness.
+    The front view shows this available area (largest Top-view width x largest
+    Side-view thickness) as a gray rectangle, and its outline is rescaled with
+    it when the top or side view changes (Edit > Fit Front View to Gray Area
+    fits an outline drawn elsewhere).
+  - The 3D view shows y and z to scale (a thicker side view gives a taller
+    model); only a long x axis is compressed.
   - Modify points at any time after drawing:
       * Drag any vertex with the left mouse button to move it.
       * Click and drag on any polygon edge midpoint (or Shift+click an edge)
@@ -54,7 +60,7 @@ Usage:
     python geometry_gui.py --install | --uninstall | --check-updates | --version
 """
 
-__version__ = "0.4.1"
+__version__ = "0.4.2"
 APP_NAME = "3D Geometry Generation"
 APP_SHORT_NAME = "3D Geometry Gen"  # macOS menu bar (CFBundleName, max. ~15 characters)
 
@@ -110,9 +116,10 @@ DEFAULT_OBJECT = {
     ],
     # Side view (x-z): 600 um long, 250 nm (0.25 um) thick
     "xz": [[-300.0, -0.125], [300.0, -0.125], [300.0, 0.125], [-300.0, 0.125]],
-    # Front view (y-z): the cross-section at the front end (x = -300 um): 0.1 um wide, 250 nm thick.
-    # Only its shape (a rectangle) is used; the width along x comes from the top view.
-    "yz": [[-0.05, -0.125], [0.05, -0.125], [0.05, 0.125], [-0.05, 0.125]],
+    # Front view (y-z): the cross-section shape (a rectangle), filling the available area of
+    # the largest top-view width (1.5 um) x the side-view thickness (250 nm). It is stretched
+    # at every x to the local width (top view) and thickness (side view).
+    "yz": [[-0.75, -0.125], [0.75, -0.125], [0.75, 0.125], [-0.75, 0.125]],
 }
 
 
@@ -279,6 +286,71 @@ def section_points_3d(section, x, y_bot, y_top, z_bot, z_top):
     return [(x, y_bot + s * (y_top - y_bot), z_bot + t * (z_top - z_bot)) for s, t in section]
 
 
+def points_box(pts):
+    """Bounding box (u0, u1, v0, v1) of 2D points, or None if it has no extent along u or v."""
+    if not pts:
+        return None
+    us, vs = [p[0] for p in pts], [p[1] for p in pts]
+    box = (min(us), max(us), min(vs), max(vs))
+    return box if box[1] - box[0] > 1e-9 and box[3] - box[2] > 1e-9 else None
+
+
+def front_view_envelope(xy_pts, xz_pts):
+    """
+    The area the Front view (y-z) cross-section is fitted into: the y-range of the
+    Top view (its largest width) x the z-range of the Side view (its largest
+    thickness), as (y0, y1, z0, z1). None while either view has no extent.
+    """
+    if len(xy_pts) < 2 or len(xz_pts) < 2:
+        return None
+    ys, zs = [p[1] for p in xy_pts], [p[1] for p in xz_pts]
+    y0, y1, z0, z1 = min(ys), max(ys), min(zs), max(zs)
+    return (y0, y1, z0, z1) if y1 - y0 > 1e-9 and z1 - z0 > 1e-9 else None
+
+
+def map_points_to_box(pts, old, new):
+    """
+    Maps 2D points linearly from the box old = (u0, u1, v0, v1) onto the box new,
+    keeping the shape relative to the box. Points on an edge of the old box land
+    exactly on the matching edge of the new one.
+    """
+    def axis(val, a0, a1, b0, b1):
+        if abs(val - a0) < 1e-9:
+            return float(b0)
+        if abs(val - a1) < 1e-9:
+            return float(b1)
+        return round(b0 + (val - a0) * (b1 - b0) / (a1 - a0), 9)
+
+    return [[axis(u, old[0], old[1], new[0], new[1]), axis(v, old[2], old[3], new[2], new[3])] for u, v in pts]
+
+
+VIEW3D_HALF_MAX = 1.35       # half length of the longest axis of the 3D view box
+VIEW3D_X_PER_SECTION = 2.45  # x is shown to scale up to this multiple of the cross-section size
+VIEW3D_MAX_RADIUS = 1.5      # the half diagonal of the view box is kept below this (fits the panel)
+VIEW3D_MIN_HALF = 0.02       # very thin axes stay visible
+
+
+def view_box_half_extents(dx, dy, dz):
+    """
+    Half extents (hx, hy, hz) of the 3D view box for a structure of dx x dy x dz,
+    and how strongly x is compressed (1.0: to scale).
+    y and z are always to scale, so the 3D model gets taller with the Side-view
+    thickness and wider with the Top-view width. x is to scale as well, unless the
+    structure is much longer than its cross-section: then x is compressed to
+    VIEW3D_X_PER_SECTION times the cross-section size.
+    """
+    dx, dy, dz = (max(float(d), 1e-9) for d in (dx, dy, dz))
+    section = max(dy, dz)
+    lx = min(dx, VIEW3D_X_PER_SECTION * section)
+    scale = VIEW3D_HALF_MAX / max(lx, section)
+    half = [lx * scale, dy * scale, dz * scale]
+    radius = math.sqrt(sum(h * h for h in half))
+    if radius > VIEW3D_MAX_RADIUS:
+        half = [h * VIEW3D_MAX_RADIUS / radius for h in half]
+    hx, hy, hz = (max(h, VIEW3D_MIN_HALF) for h in half)
+    return hx, hy, hz, dx / lx
+
+
 # ----------------------------------------------------------------------
 # 2D view helpers (GUI independent): axis ticks and mirroring
 # ----------------------------------------------------------------------
@@ -394,7 +466,8 @@ def reconstruct_geometry(xy_pts, xz_pts, yz_pts):
       * Front view (y-z): the cross-section shape, stretched at every x to the
                           local width and thickness from the other two views.
                           Only its shape matters: its own width and height are
-                          not used (the Top and Side views define them).
+                          not used (the Top and Side views define them; the GUI
+                          keeps it fitted to front_view_envelope()).
     The solid is split into longitudinal segments at every x-vertex of the top
     and side views; within a segment all bounds vary linearly.
     Raises GeometryError for incomplete/degenerate input.
@@ -1648,6 +1721,8 @@ THEME = {
     "grid_minor": "#181c22",
     "grid_axis": "#3a414d",
     "guide": "#2f3742",
+    "envelope_fill": "#22272f",  # Front view: area available to the cross-section
+    "envelope_edge": "#6b7380",
     "text": "#e6e9ef",
     "text_muted": "#8b93a1",
     "text_dim": "#5c6370",
@@ -2170,6 +2245,9 @@ class OrthoCanvas2D(tk.Frame):
         self.fill_color = THEME["shape_fill"]
         self.edge_color = THEME["shape_edge"]
         self.background = []  # [(points, closed, outline colour), ...]
+        # Gray area (u0, u1, v0, v1) the outline is fitted into (Front view), or None
+        self.envelope = None
+        self.envelope_label = ""
 
         # Panning state (middle-drag or Space+drag)
         self._pan_start = None
@@ -2640,6 +2718,17 @@ class OrthoCanvas2D(tk.Frame):
 
         u_min, u_max = self.u_range
         v_min, v_max = self.v_range
+
+        # Gray area available to the outline (below the grid; its border is drawn after it)
+        env_px = None
+        if self.envelope is not None:
+            eu0, eu1, ev0, ev1 = self.envelope
+            ex0, ey1 = self.uv_to_px(eu0, ev0)
+            ex1, ey0 = self.uv_to_px(eu1, ev1)
+            env_px = (ex0, ey0, ex1, ey1)
+            cx0, cy0, cx1, cy1 = max(ex0, x0), max(ey0, y0), min(ex1, x1), min(ey1, y1)
+            if cx1 > cx0 and cy1 > cy0:
+                c.create_rectangle(cx0, cy0, cx1, cy1, fill=T["envelope_fill"], outline="")
         tick_font = (FONT_UI, 9)
 
         # 1. Grid adapted to the zoom: faint minor lines (= snap grid), major lines with
@@ -2683,6 +2772,18 @@ class OrthoCanvas2D(tk.Frame):
             if v_min <= gv <= v_max and abs(gv) > 1e-9:
                 _, py = self.uv_to_px(0, gv)
                 c.create_line(x0, py, x1, py, fill=T["guide"], dash=(3, 4))
+
+        if env_px is not None:
+            ex0, ey0, ex1, ey1 = env_px
+            if ex1 > x0 and ex0 < x1 and ey1 > y0 and ey0 < y1:
+                c.create_rectangle(
+                    max(ex0, x0), max(ey0, y0), min(ex1, x1), min(ey1, y1), outline=T["envelope_edge"], dash=(5, 3)
+                )
+                if self.envelope_label and ex1 - ex0 > 150 and y0 <= ey0 - 9:
+                    c.create_text(
+                        max(ex0, x0) + 4, ey0 - 3, text=self.envelope_label, font=(FONT_UI, 8),
+                        fill=T["text_muted"], anchor="sw",
+                    )
 
         # Axis titles
         c.create_text(
@@ -2850,6 +2951,8 @@ class View3DCanvas(tk.Frame):
         """marker_colors: {line index: colour} for the '■' layer markers of the info card."""
         self.faces_3d = faces_3d
         self.bbox_3d = bbox_3d
+        xmin, xmax, ymin, ymax, zmin, zmax = bbox_3d
+        self._half = view_box_half_extents(xmax - xmin, ymax - ymin, zmax - zmin)
         self.summary_text = summary_text
         self.marker_colors = marker_colors or {}
         self._build_tree()
@@ -2909,11 +3012,11 @@ class View3DCanvas(tk.Frame):
             dx = max(xmax - xmin, 1e-6)
             dy = max(ymax - ymin, 1e-6)
             dz = max(zmax - zmin, 1e-6)
-            # Normalized schematic proportions so x (long), y (width), and z (thin layer)
-            # are all clearly visible in 3D
-            nx = (x - xmid) / (dx * 0.5) * 1.35
-            ny = (y - ymid) / (dy * 0.5) * 0.55
-            nz = (z - zmid) / (dz * 0.5) * 0.22
+            # y and z to scale (thickness and width keep their true ratio); a long x is compressed
+            hx, hy, hz, _ = self._half
+            nx = (x - xmid) / (dx * 0.5) * hx
+            ny = (y - ymid) / (dy * 0.5) * hy
+            nz = (z - zmid) / (dz * 0.5) * hz
         return nx, ny, nz
 
     def _project_normalized(self, nx, ny, nz, cx, cy, scale):
@@ -3010,6 +3113,9 @@ class View3DCanvas(tk.Frame):
         self._badge(0.5 * (p_x0[0] + p_x1[0]), 0.5 * (p_x0[1] + p_x1[1]) + 16, f"Δx = {xmax - xmin:g} μm", "#74c0fc")
         self._badge(0.5 * (p_x1[0] + p_y1[0]) + 30, 0.5 * (p_x1[1] + p_y1[1]) + 10, f"Δy = {ymax - ymin:g} μm", "#63e6be")
         self._badge(0.5 * (p_x1[0] + p_z1[0]) + 40, 0.5 * (p_x1[1] + p_z1[1]), f"Δz = {(zmax - zmin)*1000:g} nm", "#ffa8a8")
+        x_factor = self._half[3]
+        scale_note = "x, y, z to scale" if x_factor < 1.01 else f"y, z to scale · x compressed {x_factor:.3g}×"
+        self.canvas.create_text(w - 12, h - 12, text=scale_note, font=(FONT_UI, 9), fill=THEME["text_dim"], anchor="se")
 
         # Info card at top-left of 3D canvas
         if self.summary_text:
@@ -3102,6 +3208,7 @@ class LumericalGeometryApp:
         self._undo_stack = []  # earlier states of all layers (see _model_state)
         self._redo_stack = []
         self._commit_pending = False
+        self._envelope = None  # gray area of the Front view the outline is currently fitted to
 
         self._build_ui()
         self._history_state = self._model_state()
@@ -3378,7 +3485,7 @@ class LumericalGeometryApp:
         self.view_yz = OrthoCanvas2D(
             grid_frame,
             title="Front view (y-z)",
-            note="cross-section shape · scaled to the Top view width and Side view thickness",
+            note="cross-section shape · fills the gray area (Top-view width × Side-view thickness)",
             u_label="y",
             v_label="z",
             u_range=[-1.05, 1.05],
@@ -3465,6 +3572,7 @@ class LumericalGeometryApp:
                     command=lambda v=view, a=axis: self.mirror_view(v, a),
                 )
         edit_menu.add_cascade(label="Mirror", menu=mirror_menu)
+        edit_menu.add_command(label="Fit Front View to Gray Area", command=self.fit_front_view)
         edit_menu.add_separator()
         edit_menu.add_command(label="Load Default Object", command=self.load_default_object)
         edit_menu.add_command(label="Clear All Views", command=self.clear_all)
@@ -4114,6 +4222,8 @@ class LumericalGeometryApp:
                 if i != self.active_layer
             ]
             view.set_points(pts, closed=closed, notify=False)
+        # the loaded outline is shown as it is (Edit > Fit Front View to Gray Area fits it)
+        self._envelope = front_view_envelope(self.view_xy.points, self.view_xz.points)
         self._update_guides()
         self._refresh_layer_ui()
 
@@ -4139,6 +4249,48 @@ class LumericalGeometryApp:
             if (view.u_guides, view.v_guides) != (u_guides, v_guides):
                 view.u_guides, view.v_guides = u_guides, v_guides
                 view.redraw()
+        envelope = front_view_envelope(xy, xz)
+        if self.view_yz.envelope != envelope:
+            self.view_yz.envelope = envelope
+            self.view_yz.envelope_label = "max. cross-section: Top-view width × Side-view thickness"
+            self.view_yz.redraw()
+
+    def _follow_envelope(self):
+        """
+        The Front view outline only gives the cross-section shape; its size comes from
+        the largest Top-view width and Side-view thickness (the gray area). When an
+        edit of the Top or Side view changes that area, the outline is rescaled with
+        it, so the Front view always shows the real cross-section. The first time both
+        views have an extent, an outline drawn elsewhere is fitted into the area.
+        """
+        if not hasattr(self, "view_yz"):
+            return
+        new = front_view_envelope(self.view_xy.points, self.view_xz.points)
+        old, self._envelope = self._envelope, new
+        yz = self.view_yz
+        if new is None or old == new or not yz.points:
+            return
+        if old is None:
+            old = points_box(yz.points)
+            if old is None:
+                return
+        yz.points = map_points_to_box(yz.points, old, new)
+        yz.redraw()
+
+    def fit_front_view(self):
+        """Edit menu: stretches the Front view outline to fill the gray area (undoable)."""
+        envelope = front_view_envelope(self.view_xy.points, self.view_xz.points)
+        box = points_box(self.view_yz.points)
+        if envelope is None:
+            self.set_status("Draw the Top (x-y) and Side (x-z) views first — they define the gray area.", "warn")
+            return
+        if box is None:
+            self.set_status("Draw the Front (y-z) cross-section first.", "warn")
+            return
+        self._commit_history()
+        self.view_yz.set_points(map_points_to_box(self.view_yz.points, box, envelope), closed=self.view_yz.closed)
+        self._commit_history()
+        self.set_status("Fitted the Front view to the Top-view width and Side-view thickness.")
 
     def _refresh_layer_ui(self):
         fill, edge = layer_colors(self.active_layer)
@@ -4329,6 +4481,7 @@ class LumericalGeometryApp:
 
     def _on_geometry_changed(self):
         """Called by the 2D views whenever points are added, moved, deleted or replaced."""
+        self._follow_envelope()
         self._update_guides()
         self._set_dirty(True)
         self._schedule_commit()

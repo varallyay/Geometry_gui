@@ -2,6 +2,7 @@
 
 import ast
 import importlib.util
+import math
 import os
 import subprocess
 import sys
@@ -864,3 +865,65 @@ def test_gui_guides_come_from_the_other_views(app):
     assert app.view_xz.u_guides == sorted({p[0] for p in gg.DEFAULT_OBJECT["xy"]})
     app.view_xy.set_points([[-10, -2], [10, -2], [10, 2], [-10, 2]])
     assert app.view_yz.u_guides == [-2, 2] and app.view_xz.u_guides == [-10, 10]
+
+
+# ----------------------------------------------------------------------
+# 0.4.2: Front view gray area (envelope) and true y:z proportions in 3D
+# ----------------------------------------------------------------------
+def test_front_view_envelope_and_mapping():
+    assert gg.front_view_envelope(gg.DEFAULT_OBJECT["xy"], gg.DEFAULT_OBJECT["xz"]) == (-0.75, 0.75, -0.125, 0.125)
+    assert gg.front_view_envelope(gg.DEFAULT_OBJECT["xy"], []) is None
+    assert gg.front_view_envelope([[0, 1], [5, 1]], gg.DEFAULT_OBJECT["xz"]) is None  # no width
+    trapezoid = [[-1, 0], [1, 0], [0.5, 1], [-0.5, 1]]
+    mapped = gg.map_points_to_box(trapezoid, (-1, 1, 0, 1), (-2, 2, 0, 0.5))
+    assert mapped == [[-2, 0], [2, 0], [1, 0.5], [-1, 0.5]]
+    assert gg.points_box(mapped) == (-2, 2, 0, 0.5)
+    assert gg.points_box([[0, 0], [1, 0]]) is None
+
+
+def test_default_front_view_fills_the_envelope():
+    assert gg.points_box(gg.DEFAULT_OBJECT["yz"]) == gg.front_view_envelope(
+        gg.DEFAULT_OBJECT["xy"], gg.DEFAULT_OBJECT["xz"]
+    )
+
+
+def test_3d_view_height_follows_the_thickness():
+    # Old code drew every structure with the same fixed height
+    _, hy1, hz1, _ = gg.view_box_half_extents(600, 1.5, 0.25)
+    _, hy2, hz2, _ = gg.view_box_half_extents(600, 1.5, 0.5)
+    assert hz2 == pytest.approx(2 * hz1) and hy2 == pytest.approx(hy1)
+    assert hz1 / hy1 == pytest.approx(0.25 / 1.5)  # y and z to scale
+    hx, hy, hz, factor = gg.view_box_half_extents(2, 2, 2)  # a cube stays a cube
+    assert hx == hy == hz and factor == 1
+    assert math.sqrt(hx * hx + hy * hy + hz * hz) <= gg.VIEW3D_MAX_RADIUS + 1e-9
+    assert gg.view_box_half_extents(600, 1.5, 0.25)[3] > 100  # long x is compressed
+
+
+def test_gui_front_view_follows_side_view_thickness(app):
+    app.load_default_object()
+    app.view_yz.set_points([[-0.75, -0.125], [0.75, -0.125], [0.25, 0.125], [-0.25, 0.125]])
+    app._commit_history()
+    assert app.view_yz.envelope == (-0.75, 0.75, -0.125, 0.125)
+    app.view_xz.set_points([[-300, -0.125], [300, -0.125], [300, 0.375], [-300, 0.375]])  # twice as thick
+    app._commit_history()
+    assert app.view_yz.envelope == (-0.75, 0.75, -0.125, 0.375)
+    assert app.view_yz.points == [[-0.75, -0.125], [0.75, -0.125], [0.25, 0.375], [-0.25, 0.375]]
+    geoms = app.generate_geometry(quiet=True)
+    assert geoms[0][1].z_span == (-0.125, 0.375)
+    app.undo()  # one step restores both views
+    assert app.view_yz.points[2] == [0.25, 0.125] and app.view_xz.points[2] == [300, 0.125]
+
+
+def test_gui_fit_front_view_and_loading_keeps_outline(app, tmp_path):
+    app.view_xy.set_points(gg.DEFAULT_OBJECT["xy"])
+    app.view_xz.set_points(gg.DEFAULT_OBJECT["xz"])
+    app.view_yz.set_points([[0, 0], [0.1, 0], [0.1, 0.05], [0, 0.05]])
+    app._commit_history()
+    path = str(tmp_path / "m.3dgg")
+    app.save_model_to(path)
+    app.open_model_path(path, confirm=False)
+    assert app.view_yz.points == [[0, 0], [0.1, 0], [0.1, 0.05], [0, 0.05]]  # shown as saved
+    app.fit_front_view()
+    assert gg.points_box(app.view_yz.points) == (-0.75, 0.75, -0.125, 0.125)
+    app.undo()
+    assert app.view_yz.points == [[0, 0], [0.1, 0], [0.1, 0.05], [0, 0.05]]
