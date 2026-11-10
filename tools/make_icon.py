@@ -3,7 +3,7 @@
 Generates the 3D Geometry Generation application / document icon.
 
 The icon shows the two-stage tapered InP waveguide of generate_structure.lsf
-(Slide 1 preset) as an extruded 3D solid, its long axis at 45 degrees to the
+(the default object) as an extruded 3D solid, its long axis at 45 degrees to the
 horizontal, on a white rounded-square background.
 
 Outputs (in ../assets):

@@ -54,7 +54,7 @@ Usage:
     python geometry_gui.py --install | --uninstall | --check-updates | --version
 """
 
-__version__ = "0.4.0"
+__version__ = "0.4.1"
 APP_NAME = "3D Geometry Generation"
 APP_SHORT_NAME = "3D Geometry Gen"  # macOS menu bar (CFBundleName, max. ~15 characters)
 
@@ -91,7 +91,8 @@ DEFAULT_CELL_NAME = "InP_waveguide"
 DEFAULT_MATERIAL = "InP"
 VIEW_KEYS = ("xy", "xz", "yz")  # Top, Side, Front view
 
-SLIDE1_PRESET = {
+# "Load default object": a two-stage tapered InP waveguide (600 um long, 1.5 um wide, 250 nm thick)
+DEFAULT_OBJECT = {
     # Top view (x-y): 12-vertex symmetric two-stage tapered InP waveguide
     "xy": [
         [-300.0, -0.05],
@@ -109,8 +110,9 @@ SLIDE1_PRESET = {
     ],
     # Side view (x-z): 600 um long, 250 nm (0.25 um) thick
     "xz": [[-300.0, -0.125], [300.0, -0.125], [300.0, 0.125], [-300.0, 0.125]],
-    # Front view (y-z): 1.5 um wide, 250 nm (0.25 um) thick
-    "yz": [[-0.75, -0.125], [0.75, -0.125], [0.75, 0.125], [-0.75, 0.125]],
+    # Front view (y-z): the cross-section at the front end (x = -300 um): 0.1 um wide, 250 nm thick.
+    # Only its shape (a rectangle) is used; the width along x comes from the top view.
+    "yz": [[-0.05, -0.125], [0.05, -0.125], [0.05, 0.125], [-0.05, 0.125]],
 }
 
 
@@ -391,6 +393,8 @@ def reconstruct_geometry(xy_pts, xz_pts, yz_pts):
                           stretched onto the x-range of the top view),
       * Front view (y-z): the cross-section shape, stretched at every x to the
                           local width and thickness from the other two views.
+                          Only its shape matters: its own width and height are
+                          not used (the Top and Side views define them).
     The solid is split into longitudinal segments at every x-vertex of the top
     and side views; within a segment all bounds vary linearly.
     Raises GeometryError for incomplete/degenerate input.
@@ -409,7 +413,7 @@ def reconstruct_geometry(xy_pts, xz_pts, yz_pts):
             "Please draw connected polygons (at least 3 points) in all three 2D views "
             "before generating the 3D geometry.\n\nCurrently missing ≥3 points in:\n  • "
             + "\n  • ".join(missing)
-            + "\n\nTip: You can also click 'Load Slide 1 Preset' to load the example geometry."
+            + "\n\nTip: The 'Load default object' button adds an example waveguide as a new layer."
         )
     if abs(polygon_area(xy_pts)) < 1e-9:
         raise GeometryError("The Top view (x-y) polygon has zero area (all points on one line).")
@@ -1698,6 +1702,181 @@ def face_colors(base, kind):
     return fill, mix_color(base, "#000000", 0.55)
 
 
+# ----------------------------------------------------------------------
+# Hidden-surface removal for the 3D view (BSP tree, GUI independent)
+# ----------------------------------------------------------------------
+# A plain depth sort of whole faces fails when solids overlap or one layer lies
+# inside another: faces of the hidden layer then show through. The faces are put
+# into a binary space partitioning tree once per geometry (splitting faces where
+# needed); walking it for an eye position gives an exact back-to-front order.
+# A fragment is (vertices, edge_flags, normal, payload); edge_flags[i] tells whether
+# the edge vertices[i] -> vertices[i + 1] lies on an edge of the original face
+# (only those are outlined, not the cuts made by the tree).
+BSP_EPS = 1e-9
+
+
+def _newell_plane(verts):
+    """(unit normal, offset) of a polygon by Newell's method, or None if it has no area."""
+    nx = ny = nz = 0.0
+    n = len(verts)
+    for i in range(n):
+        x1, y1, z1 = verts[i]
+        x2, y2, z2 = verts[(i + 1) % n]
+        nx += (y1 - y2) * (z1 + z2)
+        ny += (z1 - z2) * (x1 + x2)
+        nz += (x1 - x2) * (y1 + y2)
+    length = math.sqrt(nx * nx + ny * ny + nz * nz)
+    if length < 1e-12:
+        return None
+    normal = (nx / length, ny / length, nz / length)
+    cx = sum(v[0] for v in verts) / n
+    cy = sum(v[1] for v in verts) / n
+    cz = sum(v[2] for v in verts) / n
+    return normal, normal[0] * cx + normal[1] * cy + normal[2] * cz
+
+
+def _plane_dist(plane, v):
+    (a, b, c), d = plane
+    return a * v[0] + b * v[1] + c * v[2] - d
+
+
+def _clip_fragment(verts, flags, plane, eps=BSP_EPS):
+    """Keeps the part of a polygon on the positive side of plane (points on the plane included)."""
+    dists = [_plane_dist(plane, v) for v in verts]
+    dists = [0.0 if abs(s) <= eps else s for s in dists]
+    out_v, out_f = [], []
+    n = len(verts)
+    for i in range(n):
+        j = (i + 1) % n
+        a, b, sa, sb, f = verts[i], verts[j], dists[i], dists[j], flags[i]
+        if sa >= 0:
+            out_v.append(a)
+            out_f.append(f if sb >= 0 or sa > 0 else False)
+            if sa > 0 and sb < 0:  # leaving the half-space: the output continues along the cut
+                t = sa / (sa - sb)
+                out_v.append(tuple(a[k] + t * (b[k] - a[k]) for k in range(3)))
+                out_f.append(False)
+        elif sb > 0:  # entering: the output continues along the original edge
+            t = sa / (sa - sb)
+            out_v.append(tuple(a[k] + t * (b[k] - a[k]) for k in range(3)))
+            out_f.append(f)
+    return out_v, out_f
+
+
+def _split_fragment(frag, plane):
+    """Splits a fragment by plane into its (front, back) parts (None where empty)."""
+    verts, flags, normal, payload = frag
+    (a, b, c), d = plane
+    parts = []
+    for p in (plane, ((-a, -b, -c), -d)):
+        v, f = _clip_fragment(verts, flags, p)
+        parts.append((v, f, normal, payload) if len(v) >= 3 and _newell_plane(v) else None)
+    return parts
+
+
+def bsp_fragments(faces):
+    """
+    Turns faces [(vertices, payload), ...] into planar fragments; a non-planar
+    quad is cut into two triangles. The vertex order defines the outward normal.
+    """
+    frags = []
+    for verts, payload in faces:
+        verts = [tuple(map(float, v)) for v in verts]
+        plane = _newell_plane(verts)
+        if plane is None:
+            continue
+        size = max(max(v[k] for v in verts) - min(v[k] for v in verts) for k in range(3))
+        flat = all(abs(_plane_dist(plane, v)) <= 1e-7 * max(size, 1e-9) for v in verts)
+        if flat or len(verts) == 3:
+            frags.append((verts, [True] * len(verts), plane[0], payload))
+            continue
+        for i in range(1, len(verts) - 1):  # fan of triangles; inner diagonals are not outlined
+            tri = [verts[0], verts[i], verts[i + 1]]
+            tri_plane = _newell_plane(tri)
+            if tri_plane is not None:
+                frags.append((tri, [i == 1, True, i == len(verts) - 2], tri_plane[0], payload))
+    return frags
+
+
+def build_bsp(fragments):
+    """Builds a BSP tree (nested lists [plane, coplanar, front, back]) without recursion."""
+    if not fragments:
+        return None
+    root = [None, [], None, None]
+    stack = [(root, list(fragments))]
+    while stack:
+        node, frags = stack.pop()
+        # splitter: among a few candidates the one that cuts the fewest other fragments
+        best, best_cost = 0, None
+        for idx in range(min(len(frags), 6)):
+            plane = _newell_plane(frags[idx][0])
+            cost = 0
+            for other in frags:
+                ds = [_plane_dist(plane, v) for v in other[0]]
+                if max(ds) > BSP_EPS and min(ds) < -BSP_EPS:
+                    cost += 1
+            if best_cost is None or cost < best_cost:
+                best, best_cost = idx, cost
+                if cost == 0:
+                    break
+        frags[0], frags[best] = frags[best], frags[0]
+        plane = _newell_plane(frags[0][0])
+        node[0] = plane
+        node[1].append(frags[0])
+        front, back = [], []
+        for frag in frags[1:]:
+            ds = [_plane_dist(plane, v) for v in frag[0]]
+            hi, lo = max(ds), min(ds)
+            if hi <= BSP_EPS and lo >= -BSP_EPS:
+                node[1].append(frag)
+            elif lo >= -BSP_EPS:
+                front.append(frag)
+            elif hi <= BSP_EPS:
+                back.append(frag)
+            else:
+                f_part, b_part = _split_fragment(frag, plane)
+                if f_part:
+                    front.append(f_part)
+                if b_part:
+                    back.append(b_part)
+        if front:
+            node[2] = [None, [], None, None]
+            stack.append((node[2], front))
+        if back:
+            node[3] = [None, [], None, None]
+            stack.append((node[3], back))
+    return root
+
+
+def bsp_back_to_front(tree, eye, cull=True):
+    """Fragments in painting order (farthest first) as seen from eye; back faces culled."""
+    order = []
+    stack = [tree] if tree else []
+    while stack:
+        item = stack.pop()
+        if item is None:
+            continue
+        if isinstance(item, tuple):  # a fragment queued for output
+            order.append(item)
+            continue
+        plane, coplanar, front, back = item
+        if _plane_dist(plane, eye) >= 0:
+            near, far = front, back
+        else:
+            near, far = back, front
+        visible = []
+        for frag in coplanar:
+            n, v0 = frag[2], frag[0][0]
+            facing = n[0] * (eye[0] - v0[0]) + n[1] * (eye[1] - v0[1]) + n[2] * (eye[2] - v0[2])
+            if facing > 0 or not cull:
+                visible.append(frag)
+        # LIFO stack: push in reverse painting order (far subtree, plane, near subtree)
+        stack.append(near)
+        stack.extend(reversed(visible))
+        stack.append(far)
+    return order
+
+
 
 class FlatButton(tk.Label):
     """Flat, theme-able button (tk.Button ignores colors on macOS)."""
@@ -1959,9 +2138,11 @@ class OrthoCanvas2D(tk.Frame):
         on_geometry_changed=None,
         on_edit_finished=None,
         on_mirror=None,
+        note=None,
     ):
         super().__init__(parent, bg=THEME["panel_bg"], highlightthickness=1, highlightbackground=THEME["border"])
         self.title = title
+        self.note = note  # short dim hint shown in the top-right corner of the plot
         self.u_label = u_label
         self.v_label = v_label
         self.default_u_range = list(u_range)
@@ -2006,6 +2187,8 @@ class OrthoCanvas2D(tk.Frame):
             anchor="w",
         )
         self.title_lbl.pack(side=tk.LEFT, padx=(12, 6), pady=6)
+        if note:
+            Tooltip(self.title_lbl, note)
 
         self.count_lbl = tk.Label(
             header,
@@ -2486,7 +2669,7 @@ class OrthoCanvas2D(tk.Frame):
                     else:
                         c.create_text(x0 - 6, py, text=label, font=tick_font, fill=T["text_muted"], anchor="e")
 
-        # 2. Reference guide lines (key Slide 1 dimensions); skip labels that would overlap
+        # 2. Guide lines (coordinates of the other two views of this layer); skip labels that would overlap
         last_label_px = None
         for gu in sorted(self.u_guides):
             if u_min <= gu <= u_max and abs(gu) > 1e-9:
@@ -2510,6 +2693,9 @@ class OrthoCanvas2D(tk.Frame):
             justify=tk.CENTER,
         )
 
+        if self.note:
+            c.create_text(x1 - 8, y0 + 8, text=self.note, font=(FONT_UI, 9), fill=T["text_dim"], anchor="ne")
+
         # Empty-view hint
         if n == 0:
             c.create_text(
@@ -2520,15 +2706,6 @@ class OrthoCanvas2D(tk.Frame):
                 fill=T["text_dim"],
             )
 
-        # 3a. Other layers: dashed outlines in their colours (not editable here)
-        for bg_pts, bg_closed, bg_color in self.background:
-            if len(bg_pts) < 2:
-                continue
-            coords = [coord for u, v in bg_pts for coord in self.uv_to_px(u, v)]
-            if bg_closed and len(bg_pts) >= 3:
-                coords += coords[:2]
-            c.create_line(*coords, fill=bg_color, width=1.5, dash=(6, 4))
-
         # 3b. Polygon & connected segments of the edited layer
         px_pts = [self.uv_to_px(u, v) for u, v in self.points]
 
@@ -2538,6 +2715,16 @@ class OrthoCanvas2D(tk.Frame):
         elif n >= 2:
             # Still drawing: open polyline
             c.create_line(*flat_coords, fill=self.edge_color, width=2)
+
+        # 3c. Other layers: dashed outlines in their colours, on top of the fill so that
+        #     layers inside this one stay visible (not editable here)
+        for bg_pts, bg_closed, bg_color in self.background:
+            if len(bg_pts) < 2:
+                continue
+            coords = [coord for u, v in bg_pts for coord in self.uv_to_px(u, v)]
+            if bg_closed and len(bg_pts) >= 3:
+                coords += coords[:2]
+            c.create_line(*coords, fill=bg_color, width=1.5, dash=(6, 4))
 
         # Highlight hovered edge when in edit mode
         if self.hover_edge_idx is not None and self.hover_edge_idx < n:
@@ -2626,6 +2813,7 @@ class View3DCanvas(tk.Frame):
         self.faces_3d = []  # Each item: (list of (x, y, z) vertices, face_type)
         self.bbox_3d = None
         self.summary_text = ""
+        self._bsp = None
 
         self.canvas.bind("<Configure>", lambda e: self.redraw())
         self.canvas.bind("<ButtonPress-1>", self._on_mouse_down)
@@ -2655,6 +2843,7 @@ class View3DCanvas(tk.Frame):
         self.faces_3d = []
         self.bbox_3d = None
         self.summary_text = ""
+        self._bsp = None
         self.redraw()
 
     def set_geometry(self, faces_3d, bbox_3d, summary_text="", marker_colors=None):
@@ -2663,7 +2852,17 @@ class View3DCanvas(tk.Frame):
         self.bbox_3d = bbox_3d
         self.summary_text = summary_text
         self.marker_colors = marker_colors or {}
+        self._build_tree()
         self.redraw()
+
+    def _build_tree(self):
+        """BSP tree of the faces in the normalized view box (built once per geometry)."""
+        faces = []
+        for face in self.faces_3d:
+            verts, face_kind = face[0], face[1]
+            base = face[2] if len(face) > 2 else THEME["shape_fill"]  # optional layer colour
+            faces.append(([self._normalize(*v) for v in verts], face_colors(base, face_kind)))
+        self._bsp = build_bsp(bsp_fragments(faces))
 
     def _on_mouse_down(self, event):
         self._drag_prev = (event.x, event.y)
@@ -2686,8 +2885,20 @@ class View3DCanvas(tk.Frame):
         self.zoom = max(0.3, min(4.0, self.zoom * factor))
         self.redraw()
 
+    # The camera looks at the origin of the normalized box from this distance
+    EYE_DISTANCE = 3.2 / 0.35
+
+    def _eye(self):
+        """Camera position in normalized box coordinates (see _project_normalized)."""
+        az, el = math.radians(self.azim), math.radians(self.elev)
+        e = self.EYE_DISTANCE
+        return (e * math.cos(el) * math.sin(az), e * math.cos(el) * math.cos(az), e * math.sin(el))
+
     def _project_point(self, x, y, z, cx, cy, scale):
-        """Normalize physical (x, y, z) to visual box [-1, 1] with schematic aspect ratio and project."""
+        return self._project_normalized(*self._normalize(x, y, z), cx, cy, scale)
+
+    def _normalize(self, x, y, z):
+        """Physical (x, y, z) to the visual box [-1, 1] with a schematic aspect ratio."""
         if self.bbox_3d is None:
             nx, ny, nz = x, y, z
         else:
@@ -2703,7 +2914,9 @@ class View3DCanvas(tk.Frame):
             nx = (x - xmid) / (dx * 0.5) * 1.35
             ny = (y - ymid) / (dy * 0.5) * 0.55
             nz = (z - zmid) / (dz * 0.5) * 0.22
+        return nx, ny, nz
 
+    def _project_normalized(self, nx, ny, nz, cx, cy, scale):
         az = math.radians(self.azim)
         el = math.radians(self.elev)
         cos_a, sin_a = math.cos(az), math.sin(az)
@@ -2718,7 +2931,7 @@ class View3DCanvas(tk.Frame):
         py_3d = -ry * sin_e + rz * cos_e
         depth = ry * cos_e + rz * sin_e
 
-        # Perspective factor
+        # Perspective factor (eye at depth = EYE_DISTANCE)
         persp = 1.0 / max(0.4, 3.2 - depth * 0.35) * 2.8
         sx = cx + px_3d * scale * self.zoom * persp
         sy = cy - py_3d * scale * self.zoom * persp
@@ -2743,7 +2956,7 @@ class View3DCanvas(tk.Frame):
             self.canvas.create_text(
                 cx,
                 cy + 14,
-                text="Draw the Top (x-y), Side (x-z) and Front (y-z) profiles\n(or load the Slide 1 preset), then press  Generate geometry.",
+                text="Draw the Top (x-y), Side (x-z) and Front (y-z) profiles\n(or load the default object), then press  Generate geometry.",
                 font=(FONT_UI, 11),
                 fill=THEME["text_dim"],
                 justify=tk.CENTER,
@@ -2779,26 +2992,18 @@ class View3DCanvas(tk.Frame):
                 dash=(2, 3),
             )
 
-        # Depth-sort faces (Painter's algorithm)
-        rendered_faces = []
-        for face in self.faces_3d:
-            verts, face_kind = face[0], face[1]
-            base = face[2] if len(face) > 2 else THEME["shape_fill"]  # optional layer colour
-            proj = [self._project_point(vx, vy, vz, cx, cy, scale) for vx, vy, vz in verts]
-            avg_depth = sum(p[2] for p in proj) / len(proj)
-            rendered_faces.append((avg_depth, proj, face_colors(base, face_kind)))
-
-        rendered_faces.sort(key=lambda item: item[0])
-
-        # Draw sorted faces
-        for _, proj, (fill_color, edge_color) in rendered_faces:
-            coords = [c for pt in proj for c in (pt[0], pt[1])]
-            self.canvas.create_polygon(
-                *coords,
-                fill=fill_color,
-                outline=edge_color,
-                width=1.2,
-            )
+        # Faces back to front from the BSP tree (exact occlusion, also for overlapping
+        # or nested layers); only the edges of the original faces are outlined
+        project = self._project_normalized
+        for verts, flags, _, (fill_color, edge_color) in bsp_back_to_front(self._bsp, self._eye()):
+            pts = [project(*v, cx, cy, scale) for v in verts]
+            coords = [c for pt in pts for c in (pt[0], pt[1])]
+            self.canvas.create_polygon(*coords, fill=fill_color, outline=fill_color, width=1)
+            n = len(pts)
+            for i in range(n):
+                if flags[i]:
+                    a, b = pts[i], pts[(i + 1) % n]
+                    self.canvas.create_line(a[0], a[1], b[0], b[1], fill=edge_color, width=1.2)
 
         # Axis dimension annotations on bounding box (on dark backdrops so they stay readable)
         p_x0, p_x1, p_y1, p_z1 = proj_corners[0], proj_corners[1], proj_corners[2], proj_corners[5]
@@ -3027,8 +3232,9 @@ class LumericalGeometryApp:
 
         caption(tools, "Project").pack(side=tk.LEFT, padx=(0, 8))
         FlatButton(
-            tools, "Load Slide 1 preset", self.load_slide1_preset, size=11, padx=10, pady=4,
-            tooltip="Load the Slide 1 InP taper into all three 2D views",
+            tools, "Load default object", self.load_default_object, size=11, padx=10, pady=4,
+            tooltip="Add an example object (a 600 μm two-stage InP taper) as a new layer\n"
+            "(into the current layer if that is still empty)",
         ).pack(side=tk.LEFT, padx=(0, 6))
         FlatButton(
             tools, "Clear all", self.clear_all, variant="danger", size=11, padx=10, pady=4,
@@ -3118,7 +3324,7 @@ class LumericalGeometryApp:
             fg=T["text_dim"],
         ).pack(side=tk.RIGHT, padx=12)
         self.set_status(
-            "Draw connected points in the Top (x-y), Side (x-z) and Front (y-z) views — or load the Slide 1 preset.",
+            "Draw connected points in the Top (x-y), Side (x-z) and Front (y-z) views — or load the default object.",
         )
 
         # ==================================================================
@@ -3134,11 +3340,6 @@ class LumericalGeometryApp:
         grid_frame.rowconfigure(0, weight=1, uniform="row")
         grid_frame.rowconfigure(1, weight=1, uniform="row")
 
-        # Key guide coordinates from Slide 1
-        x_guides = [-300.0, -110.0, -100.0, 0.0, 100.0, 110.0, 300.0]
-        y_guides = [-0.75, -0.25, -0.05, 0.0, 0.05, 0.25, 0.75]
-        z_guides = [-0.125, 0.0, 0.125]
-
         # 1. Top-Left: Top View (x-y)
         self.view_xy = OrthoCanvas2D(
             grid_frame,
@@ -3147,8 +3348,6 @@ class LumericalGeometryApp:
             v_label="y",
             u_range=[-340.0, 340.0],
             v_range=[-1.05, 1.05],
-            u_guides=x_guides,
-            v_guides=y_guides,
             on_point_selected=self._on_point_selected,
             on_geometry_changed=self._on_geometry_changed,
             on_edit_finished=self._commit_history,
@@ -3164,8 +3363,6 @@ class LumericalGeometryApp:
             v_label="z",
             u_range=[-340.0, 340.0],
             v_range=[-0.28, 0.28],
-            u_guides=x_guides,
-            v_guides=z_guides,
             on_point_selected=self._on_point_selected,
             on_geometry_changed=self._on_geometry_changed,
             on_edit_finished=self._commit_history,
@@ -3181,12 +3378,11 @@ class LumericalGeometryApp:
         self.view_yz = OrthoCanvas2D(
             grid_frame,
             title="Front view (y-z)",
+            note="cross-section shape · scaled to the Top view width and Side view thickness",
             u_label="y",
             v_label="z",
             u_range=[-1.05, 1.05],
             v_range=[-0.28, 0.28],
-            u_guides=y_guides,
-            v_guides=z_guides,
             on_point_selected=self._on_point_selected,
             on_geometry_changed=self._on_geometry_changed,
             on_edit_finished=self._commit_history,
@@ -3270,7 +3466,7 @@ class LumericalGeometryApp:
                 )
         edit_menu.add_cascade(label="Mirror", menu=mirror_menu)
         edit_menu.add_separator()
-        edit_menu.add_command(label="Load Slide 1 Preset", command=self.load_slide1_preset)
+        edit_menu.add_command(label="Load Default Object", command=self.load_default_object)
         edit_menu.add_command(label="Clear All Views", command=self.clear_all)
         menubar.add_cascade(label="Edit", menu=edit_menu)
 
@@ -3918,7 +4114,31 @@ class LumericalGeometryApp:
                 if i != self.active_layer
             ]
             view.set_points(pts, closed=closed, notify=False)
+        self._update_guides()
         self._refresh_layer_ui()
+
+    def _update_guides(self):
+        """
+        Guide lines of each view: the coordinates drawn in the other two views of
+        the current layer (e.g. the Front view shows the widths of the Top view),
+        so the three views are easy to keep consistent. Points snap to them.
+        """
+        if not hasattr(self, "view_yz"):
+            return
+        xy, xz, yz = self.view_xy.points, self.view_xz.points, self.view_yz.points
+
+        def coords(pts, axis):
+            return sorted({round(p[axis], 9) for p in pts})
+
+        wanted = {
+            self.view_xy: (coords(xz, 0), coords(yz, 0)),
+            self.view_xz: (coords(xy, 0), coords(yz, 1)),
+            self.view_yz: (coords(xy, 1), coords(xz, 1)),
+        }
+        for view, (u_guides, v_guides) in wanted.items():
+            if (view.u_guides, view.v_guides) != (u_guides, v_guides):
+                view.u_guides, view.v_guides = u_guides, v_guides
+                view.redraw()
 
     def _refresh_layer_ui(self):
         fill, edge = layer_colors(self.active_layer)
@@ -4109,6 +4329,7 @@ class LumericalGeometryApp:
 
     def _on_geometry_changed(self):
         """Called by the 2D views whenever points are added, moved, deleted or replaced."""
+        self._update_guides()
         self._set_dirty(True)
         self._schedule_commit()
         if self.geometry is not None and not self.geometry_outdated:
@@ -4146,13 +4367,24 @@ class LumericalGeometryApp:
         self.set_status(f"Mirrored the {half} half of the {view.title} onto the other side of {label} = 0.")
         self._commit_history()
 
-    def load_slide1_preset(self):
-        """Loads the exact Slide 1 geometry into the three orthographic 2D views."""
-        self.view_xy.set_points(SLIDE1_PRESET["xy"], closed=True)
-        self.view_xz.set_points(SLIDE1_PRESET["xz"], closed=True)
-        self.view_yz.set_points(SLIDE1_PRESET["yz"], closed=True)
+    def load_default_object(self):
+        """
+        Loads the default object (a two-stage InP taper) as a new layer, so the
+        existing layers stay untouched. An empty current layer is used directly.
+        One undo step removes it again.
+        """
+        self._commit_history()
+        self._sync_active_layer()
+        if any(pts for pts, _ in self.layers[self.active_layer]["views"].values()):
+            spec = next_free_layer([layer["spec"] for layer in self.layers])
+            self.layers.append(self._new_layer(spec))
+            self._load_layer(len(self.layers) - 1)
+        for key, view in self._views().items():
+            view.set_points(DEFAULT_OBJECT[key], closed=True)
+        self._commit_history()
         self.set_status(
-            "Loaded the Slide 1 geometry into all three views. Drag any vertex to modify it, or press Generate geometry."
+            f"Loaded the default object into layer {format_layer(self.layers[self.active_layer]['spec'])}. "
+            "Drag any vertex to modify it, or press Generate geometry."
         )
 
     # ==================================================================
@@ -4306,8 +4538,8 @@ class LumericalGeometryApp:
 
 
 def export_preset_cli(paths, cell_name, layer_text):
-    """Exports the Slide 1 preset geometry without opening the GUI."""
-    geom = reconstruct_geometry(SLIDE1_PRESET["xy"], SLIDE1_PRESET["xz"], SLIDE1_PRESET["yz"])
+    """Exports the default object without opening the GUI."""
+    geom = reconstruct_geometry(DEFAULT_OBJECT["xy"], DEFAULT_OBJECT["xz"], DEFAULT_OBJECT["yz"])
     layer = parse_layer_spec(layer_text)
     for path in paths:
         print(f"{path}: {export_geometry(geom, path, cell_name, layer)}")
@@ -4377,7 +4609,7 @@ def main(argv=None):
         "--export-preset",
         nargs="+",
         metavar="FILE",
-        help="export the Slide 1 preset to FILE(s) (.lsf, .gds or .py) without opening the GUI",
+        help="export the default object to FILE(s) (.lsf, .gds or .py) without opening the GUI",
     )
     parser.add_argument("--layer", default="1/0", help="GDS layer/datatype (default: 1/0)")
     parser.add_argument("--cell", default=DEFAULT_CELL_NAME, help=f"GDS cell name (default: {DEFAULT_CELL_NAME})")

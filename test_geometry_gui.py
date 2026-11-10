@@ -19,7 +19,7 @@ RECT_YZ = [[0, -0.1], [1.2, -0.1], [1.2, 0.1], [0, 0.1]]
 
 @pytest.fixture
 def preset():
-    return gg.reconstruct_geometry(gg.SLIDE1_PRESET["xy"], gg.SLIDE1_PRESET["xz"], gg.SLIDE1_PRESET["yz"])
+    return gg.reconstruct_geometry(gg.DEFAULT_OBJECT["xy"], gg.DEFAULT_OBJECT["xz"], gg.DEFAULT_OBJECT["yz"])
 
 
 def read_gds_polygons(path):
@@ -199,7 +199,7 @@ def test_gds_roundtrip(preset, tmp_path, backend):
     dbu, cells, shapes = read_gds_polygons(path)
     assert dbu == pytest.approx(0.001)
     assert cells == ["my_wg"]
-    expected = sorted((round(x * 1000), round(y * 1000)) for x, y in gg.SLIDE1_PRESET["xy"])
+    expected = sorted((round(x * 1000), round(y * 1000)) for x, y in gg.DEFAULT_OBJECT["xy"])
     assert shapes == {(34, 2): [expected]}
 
 
@@ -283,7 +283,7 @@ def test_cli_export(tmp_path):
 # Model files (.3dgg)
 # ----------------------------------------------------------------------
 def preset_views():
-    return {key: (gg.SLIDE1_PRESET[key], True) for key in gg.VIEW_KEYS}
+    return {key: (gg.DEFAULT_OBJECT[key], True) for key in gg.VIEW_KEYS}
 
 
 def test_model_round_trip(tmp_path):
@@ -295,7 +295,7 @@ def test_model_round_trip(tmp_path):
     assert [layer["gds_layer"] for layer in data["layers"]] == ["5/1"]  # single views dict -> one layer
     for key in gg.VIEW_KEYS:
         view = data["layers"][0]["views"][key]
-        assert view["points"] == [[float(u), float(v)] for u, v in gg.SLIDE1_PRESET[key]]
+        assert view["points"] == [[float(u), float(v)] for u, v in gg.DEFAULT_OBJECT[key]]
         assert view["closed"] is True
     assert data["export"] == {"format": "GDSII layout (.gds)", "cell_name": "taper"}
     assert data["editor"] == {"snap": False}
@@ -306,7 +306,7 @@ def test_model_reads_version_1_files(tmp_path):
     path = tmp_path / "old.3dgg"
     old = {
         "format": "3dgg", "format_version": 1,
-        "views": {k: {"points": gg.SLIDE1_PRESET[k], "closed": True} for k in gg.VIEW_KEYS},
+        "views": {k: {"points": gg.DEFAULT_OBJECT[k], "closed": True} for k in gg.VIEW_KEYS},
         "export": {"format": "GDSII layout (.gds)", "gds_layer": "7/2", "cell_name": "old"},
     }
     path.write_text(__import__("json").dumps(old))
@@ -319,7 +319,7 @@ def test_model_reads_version_1_files(tmp_path):
 def two_layers():
     rib = {"xy": [[-50, -1], [50, -1], [50, 1], [-50, 1]], "xz": [[-50, 0.125], [50, 0.125], [50, 0.4], [-50, 0.4]],
            "yz": [[-1, 0.125], [1, 0.125], [1, 0.4], [-1, 0.4]]}
-    return [((1, 0), dict(gg.SLIDE1_PRESET)), ((2, 0), rib)]
+    return [((1, 0), dict(gg.DEFAULT_OBJECT)), ((2, 0), rib)]
 
 
 def test_model_round_trip_several_layers(tmp_path):
@@ -536,7 +536,7 @@ def app(monkeypatch, tmp_path):
 
 def test_gui_export_uses_current_drawing(app):
     # Old code exported the cached geometry, ignoring edits made after "Generate geometry"
-    app.load_slide1_preset()
+    app.load_default_object()
     first = app.build_lsf_content()
     app.view_xy.selected_idx = 0
     app.view_xy.update_selected_point(-300.0, -0.5)
@@ -555,7 +555,7 @@ def test_gui_incomplete_views_warn_instead_of_crash(app):
 
 
 def test_gui_generate_file_all_formats(app, tmp_path, monkeypatch):
-    app.load_slide1_preset()
+    app.load_default_object()
     app.format_var.set("All (.lsf + .gds + .py)")
     out_dir = tmp_path / "export"
     out_dir.mkdir()
@@ -566,7 +566,7 @@ def test_gui_generate_file_all_formats(app, tmp_path, monkeypatch):
 
 
 def test_gui_save_and_open_model(app, tmp_path):
-    app.load_slide1_preset()
+    app.load_default_object()
     app.ent_cell.delete(0, "end")
     app.ent_cell.insert(0, "my_cell")
     assert app.dirty
@@ -578,7 +578,7 @@ def test_gui_save_and_open_model(app, tmp_path):
     app.clear_all()
     app.dirty = False
     assert app.open_model_path(str(path))
-    assert app.view_xy.points == [[float(u), float(v)] for u, v in gg.SLIDE1_PRESET["xy"]]
+    assert app.view_xy.points == [[float(u), float(v)] for u, v in gg.DEFAULT_OBJECT["xy"]]
     assert app.ent_cell.get() == "my_cell"
     assert app.geometry is not None and not app.dirty
     assert app.config["recent_files"][0] == str(path)
@@ -614,13 +614,13 @@ UPPER_EDGE = [[-300, 0.05], [-110, 0.25], [-100, 0.75], [100, 0.75], [110, 0.25]
 def test_mirror_upper_profile(closed):
     pts, sign = gg.mirror_outline(UPPER_EDGE, closed=closed, axis="v")
     assert sign == 1
-    assert sorted(map(tuple, pts)) == sorted(map(tuple, gg.SLIDE1_PRESET["xy"]))
+    assert sorted(map(tuple, pts)) == sorted(map(tuple, gg.DEFAULT_OBJECT["xy"]))
 
 
 def test_mirror_keeps_shape_when_already_symmetric():
-    pts, _ = gg.mirror_outline(gg.SLIDE1_PRESET["xy"], closed=True, axis="v")
-    assert sorted(map(tuple, pts)) == sorted(map(tuple, gg.SLIDE1_PRESET["xy"]))
-    assert abs(gg.polygon_area(pts)) == pytest.approx(abs(gg.polygon_area(gg.SLIDE1_PRESET["xy"])))
+    pts, _ = gg.mirror_outline(gg.DEFAULT_OBJECT["xy"], closed=True, axis="v")
+    assert sorted(map(tuple, pts)) == sorted(map(tuple, gg.DEFAULT_OBJECT["xy"]))
+    assert abs(gg.polygon_area(pts)) == pytest.approx(abs(gg.polygon_area(gg.DEFAULT_OBJECT["xy"])))
 
 
 def test_mirror_front_view_left_right():
@@ -670,7 +670,7 @@ def test_gui_undo_redo(app):
 
 
 def test_gui_undo_clear_all_and_mirror(app):
-    app.load_slide1_preset()
+    app.load_default_object()
     app._commit_history()
     app.clear_all()
     app._commit_history()
@@ -685,7 +685,7 @@ def test_gui_undo_clear_all_and_mirror(app):
 
 
 def test_gui_open_model_resets_history(app, tmp_path):
-    app.load_slide1_preset()
+    app.load_default_object()
     path = tmp_path / "m.3dgg"
     app.save_model_to(str(path))
     app.open_model_path(str(path), confirm=False)
@@ -711,7 +711,7 @@ def test_gui_snap_follows_zoom(app):
 # GUI: layers
 # ----------------------------------------------------------------------
 def test_gui_layers_switch_and_keep_drawings(app):
-    app.load_slide1_preset()
+    app.load_default_object()
     first_xy = [list(p) for p in app.view_xy.points]
     app.add_layer()
     assert app.active_layer == 1 and app.layer_var.get() == "2/0"
@@ -726,7 +726,7 @@ def test_gui_layers_switch_and_keep_drawings(app):
 
 
 def test_gui_generate_and_save_several_layers(app, tmp_path):
-    app.load_slide1_preset()
+    app.load_default_object()
     app.add_layer()
     for (key, view), pts in zip(app._views().items(), two_layers()[1][1].values()):
         view.set_points(pts)
@@ -746,7 +746,7 @@ def test_gui_generate_and_save_several_layers(app, tmp_path):
 
 
 def test_gui_undo_add_and_delete_layer(app):
-    app.load_slide1_preset()
+    app.load_default_object()
     app._commit_history()
     app.add_layer()
     app.view_xy.set_points([[0, 0], [1, 0], [1, 1]])
@@ -772,3 +772,95 @@ def test_gui_change_layer_number(app, monkeypatch):
     monkeypatch.setattr(gg.simpledialog, "askstring", lambda *a, **k: "10/3")
     app.change_layer_number()
     assert app.layer_var.get() == "10/3" and app.layers[1]["spec"] == (10, 3)
+
+
+# ----------------------------------------------------------------------
+# 3D view: hidden-surface removal (BSP tree)
+# ----------------------------------------------------------------------
+def _box_faces(x0, x1, y0, y1, z0, z1, tag):
+    geom = gg.reconstruct_geometry(
+        [[x0, y0], [x1, y0], [x1, y1], [x0, y1]],
+        [[x0, z0], [x1, z0], [x1, z1], [x0, z1]],
+        [[y0, z0], [y1, z0], [y1, z1], [y0, z1]],
+    )
+    return [(verts, tag) for verts, _ in geom.faces]
+
+
+def _ray_hit(eye, direction, verts):
+    """Distance along the ray to the planar polygon, or None if it misses."""
+    (nx, ny, nz), d = gg._newell_plane(verts)
+    denom = nx * direction[0] + ny * direction[1] + nz * direction[2]
+    if abs(denom) < 1e-12:
+        return None
+    t = (d - (nx * eye[0] + ny * eye[1] + nz * eye[2])) / denom
+    if t <= 0:
+        return None
+    p = [eye[k] + t * direction[k] for k in range(3)]
+    drop = max(range(3), key=lambda k: abs((nx, ny, nz)[k]))  # project onto the dominant plane
+    a, b = [k for k in range(3) if k != drop]
+    inside = False
+    for i in range(len(verts)):
+        p1, p2 = verts[i], verts[i - 1]
+        if (p1[b] > p[b]) != (p2[b] > p[b]):
+            if p[a] < p1[a] + (p[b] - p1[b]) * (p2[a] - p1[a]) / (p2[b] - p1[b]):
+                inside = not inside
+    return t if inside else None
+
+
+@pytest.mark.parametrize("eye", [(6, 2.5, 3), (-4, 5, 1.5), (0.5, -7, -2), (-6, -3, 4), (2, 1, -8)])
+def test_bsp_order_hides_a_layer_inside_another(eye):
+    # Old depth sort: faces of a layer inside another one showed through
+    faces = _box_faces(-1, 1, -1, 1, -0.5, 0.5, "outer") + _box_faces(-0.6, 0.4, -0.3, 0.5, -0.2, 0.4, "inner")
+    faces += _box_faces(0.5, 1.6, -0.2, 0.2, -0.8, 0.0, "crossing")  # pierces the outer box
+    order = gg.bsp_back_to_front(gg.build_bsp(gg.bsp_fragments(faces)), eye)
+    for i in range(-6, 7):
+        for j in range(-6, 7):
+            target = (0.18 * i, 0.18 * j, 0.09 * (i - j))
+            direction = [target[k] - eye[k] for k in range(3)]
+            hits = [(t, idx) for idx, frag in enumerate(order) if (t := _ray_hit(eye, direction, frag[0]))]
+            if hits:
+                nearest = min(hits)[0]
+                painted = max(idx for _, idx in hits)  # the fragment drawn last wins
+                assert _ray_hit(eye, direction, order[painted][0]) == pytest.approx(nearest, abs=1e-9)
+
+
+def test_bsp_outlines_only_original_edges():
+    faces = _box_faces(-1, 1, -1, 1, -1, 1, "a") + _box_faces(0, 2, -0.5, 0.5, -0.5, 0.5, "b")
+    frags = gg.bsp_fragments(faces)
+    split = gg.bsp_back_to_front(gg.build_bsp(frags), (5, 4, 3), cull=False)
+    assert len(split) > len(frags)  # faces were cut where the boxes intersect
+    assert any(not all(flags) for _, flags, _, _ in split)  # cuts are not outlined
+
+
+def test_bsp_non_planar_quad_becomes_triangles():
+    quad = [(0, 0, 0), (1, 0, 0), (1, 1, 0.3), (0, 1, 0)]
+    frags = gg.bsp_fragments([(quad, "q")])
+    assert len(frags) == 2 and all(len(f[0]) == 3 for f in frags)
+    assert [f[1] for f in frags] == [[True, True, False], [False, True, True]]
+
+
+# ----------------------------------------------------------------------
+# GUI: default object, cross-view guides
+# ----------------------------------------------------------------------
+def test_gui_default_object_goes_to_a_new_layer(app):
+    app.load_default_object()  # first layer is empty: used directly
+    assert len(app.layers) == 1 and app.view_xy.points == [[float(u), float(v)] for u, v in gg.DEFAULT_OBJECT["xy"]]
+    app.add_layer()
+    app.view_xy.set_points([[-50, -1], [50, -1], [50, 1], [-50, 1]])
+    app._commit_history()
+    app.load_default_object()  # two drawn layers: the object becomes layer 3/0
+    assert [gg.format_layer(layer["spec"]) for layer in app.layers] == ["1/0", "2/0", "3/0"]
+    assert app.active_layer == 2 and len(app.view_xy.points) == 12
+    app._sync_active_layer()
+    assert app.layers[1]["views"]["xy"][0] == [[-50, -1], [50, -1], [50, 1], [-50, 1]]  # untouched
+    app.undo()  # one step removes it again
+    assert len(app.layers) == 2 and app.view_xy.points == [[-50, -1], [50, -1], [50, 1], [-50, 1]]
+
+
+def test_gui_guides_come_from_the_other_views(app):
+    app.load_default_object()
+    assert app.view_yz.u_guides == sorted({p[1] for p in gg.DEFAULT_OBJECT["xy"]})  # widths of the top view
+    assert app.view_yz.v_guides == [-0.125, 0.125]  # thickness of the side view
+    assert app.view_xz.u_guides == sorted({p[0] for p in gg.DEFAULT_OBJECT["xy"]})
+    app.view_xy.set_points([[-10, -2], [10, -2], [10, 2], [-10, 2]])
+    assert app.view_yz.u_guides == [-2, 2] and app.view_xz.u_guides == [-10, 10]
